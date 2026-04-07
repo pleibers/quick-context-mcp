@@ -238,6 +238,20 @@ class SearchRepoContextTests(unittest.TestCase):
             self.assertEqual(result["searched_directory"], str(root.resolve()))
             self.assertEqual(result["ranked_files"][0]["path"], "model.py")
 
+    def test_accepts_dot_directory_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "model.py").write_text("def snow_component():\n    return 1\n", encoding="utf-8")
+            previous_cwd = Path.cwd()
+            os.chdir(root)
+            try:
+                result = search_repo_context_result(keywords=["snow"], directory=".")
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(result["searched_directory"], str(root.resolve()))
+            self.assertEqual(result["ranked_files"][0]["path"], "model.py")
+
     def test_tool_reads_budget_defaults_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
