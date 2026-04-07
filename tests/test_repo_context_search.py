@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import os
 from pathlib import Path
 import tempfile
@@ -10,6 +11,31 @@ from repo_context_search import search_repo_context_result
 
 
 class SearchRepoContextTests(unittest.TestCase):
+    class _FakeRootsResult:
+        def __init__(self, roots: list[object]) -> None:
+            self.roots = roots
+
+    class _FakeRoot:
+        def __init__(self, uri: str) -> None:
+            self.uri = uri
+
+    class _FakeSession:
+        def __init__(self, roots: list[object]) -> None:
+            self._roots = roots
+
+        async def list_roots(self) -> object:
+            return SearchRepoContextTests._FakeRootsResult(self._roots)
+
+    class _FakeRequestContext:
+        def __init__(self, session: object) -> None:
+            self.session = session
+
+    class _FakeContext:
+        def __init__(self, roots: list[object]) -> None:
+            self.request_context = SearchRepoContextTests._FakeRequestContext(
+                SearchRepoContextTests._FakeSession(roots)
+            )
+
     def test_prefers_source_and_definition_hits_over_docs(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -122,35 +148,6 @@ class SearchRepoContextTests(unittest.TestCase):
             )
             self.assertLessEqual(total_lines, 3)
 
-    def test_reports_eligible_matches_omitted_by_max_files(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            (root / "src").mkdir()
-            for index in range(3):
-                (root / "src" / f"model_{index}.py").write_text(
-                    "\n".join(
-                        [
-                            f"def snow_component_{index}():",
-                            "    return 'melt'",
-                        ]
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
-
-            result = search_repo_context_result(
-                keywords=["snow", "melt"],
-                directory=str(root),
-                max_files=1,
-            )
-
-            self.assertEqual(len(result["ranked_files"]), 1)
-            self.assertEqual(result["summary"]["omitted_ranked_files"], 2)
-            self.assertEqual(
-                [item["path"] for item in result["omitted_ranked_files"]],
-                ["src/model_1.py", "src/model_2.py"],
-            )
-
     def test_excludes_generated_binary_and_large_files(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -175,19 +172,6 @@ class SearchRepoContextTests(unittest.TestCase):
             ranked_paths = [item["path"] for item in result["ranked_files"]]
             self.assertEqual(ranked_paths, ["src/model.py"])
             self.assertEqual(result["summary"]["files_considered"], 1)
-            self.assertEqual(result["summary"]["excluded_keyword_matches"], 3)
-            self.assertEqual(
-                [item["path"] for item in result["excluded_keyword_matches"]],
-                ["generated/autogen.py", "data.bin", "large.txt"],
-            )
-            self.assertEqual(
-                result["excluded_keyword_matches"][0]["reason"],
-                "generated directory: generated",
-            )
-            self.assertEqual(
-                result["excluded_keyword_matches"][1]["matched_keywords"],
-                ["snow"],
-            )
 
     def test_returns_guidance_when_no_matches_found(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -202,7 +186,6 @@ class SearchRepoContextTests(unittest.TestCase):
 
             self.assertEqual(result["ranked_files"], [])
             self.assertEqual(result["snippets"], [])
-            self.assertEqual(result["excluded_keyword_matches"], [])
             self.assertIn("fall back to normal repository context search", result["usage_guidance"])
 
     def test_returns_docs_when_only_docs_match(self) -> None:
@@ -252,6 +235,37 @@ class SearchRepoContextTests(unittest.TestCase):
             self.assertEqual(result["searched_directory"], str(root.resolve()))
             self.assertEqual(result["ranked_files"][0]["path"], "model.py")
 
+    def test_tool_resolves_dot_directory_against_client_root(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "model.py").write_text(
+                "def snow_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+            ctx = self._FakeContext([self._FakeRoot(root.resolve().as_uri())])
+            previous_cwd = Path.cwd()
+            os.chdir(Path("/tmp"))
+            try:
+                result = asyncio.run(
+                    search_repo_context(
+                        keywords=["snow"],
+                        directory=".",
+                        ctx=ctx,
+                    )
+                )
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(result["searched_directory"], str(root.resolve()))
+            self.assertEqual(result["ranked_files"][0]["path"], "model.py")
+
+    def test_tool_rejects_relative_directory_without_client_roots(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError,
+            "relative directory paths such as '.' are not reliable across MCP clients",
+        ):
+            asyncio.run(search_repo_context(keywords=["snow"], directory="."))
+
     def test_tool_reads_budget_defaults_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -270,9 +284,11 @@ class SearchRepoContextTests(unittest.TestCase):
             os.environ["QUICK_SEARCH_MAX_SNIPPETS"] = "1"
             os.environ["QUICK_SEARCH_MAX_TOTAL_LINES"] = "1"
             try:
-                result = search_repo_context(
-                    keywords=["snow", "melt"],
-                    directory=str(root),
+                result = asyncio.run(
+                    search_repo_context(
+                        keywords=["snow", "melt"],
+                        directory=str(root),
+                    )
                 )
             finally:
                 for key, value in previous_env.items():
@@ -320,8 +336,6 @@ class SearchRepoContextTests(unittest.TestCase):
 
             joined_logs = "\n".join(captured.output)
             self.assertIn("repo search root=", joined_logs)
-            self.assertIn("omitted_ranked_files=0", joined_logs)
-            self.assertIn("excluded_keyword_matches=0", joined_logs)
             self.assertIn("rank=1 path=src/model.py", joined_logs)
             self.assertIn("shown_lines=1/4 (25.0%)", joined_logs)
 

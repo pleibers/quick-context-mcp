@@ -28,9 +28,7 @@ The result is compact structured JSON with:
 
 - summary counts
 - ranked files
-- eligible ranked files omitted by `max_files`
 - snippet excerpts
-- excluded matching files that were filtered out of ranking
 - short usage guidance for the calling agent
 
 ## Retrieval Behavior
@@ -86,7 +84,10 @@ Internal implementation defaults also include:
 Parameter notes:
 
 - `keywords` must contain at least one non-empty string
-- `directory` defaults to the current working directory seen by the MCP process
+- `directory` should be an absolute path for reliable agent behavior
+- relative paths such as `.` are not portable across MCP clients and only work when the client exposes roots
+- if you are calling this tool from an agent, do not rely on `.` meaning the agent's current directory; pass an absolute `directory`
+- if `directory` is omitted, the server falls back to its own process working directory unless exactly one client root is exposed
 - `max_files`, `max_snippets`, and `max_total_lines` must be `>= 1`
 - `lines_before` and `lines_after` must be `>= 0`
 - per-call values override configured environment defaults
@@ -102,9 +103,7 @@ Typical output shape:
     "files_considered": 1832,
     "files_ranked": 47,
     "files_returned": 12,
-    "omitted_ranked_files": 35,
     "snippets_returned": 24,
-    "excluded_keyword_matches": 3,
     "budget_truncated": true
   },
   "ranked_files": [
@@ -118,16 +117,6 @@ Typical output shape:
       "reason": "high hit count, multiple keywords, source file, definition hits"
     }
   ],
-  "omitted_ranked_files": [
-    {
-      "path": "src/model/legacy_snow.jl",
-      "is_source_file": true,
-      "keyword_hits": 7,
-      "distinct_keywords_matched": 2,
-      "score": 0.62,
-      "reason": "source file, moderate hit density"
-    }
-  ],
   "snippets": [
     {
       "path": "src/model/snow_energy_balance.jl",
@@ -135,14 +124,6 @@ Typical output shape:
       "line_end": 140,
       "matched_keywords": ["snow", "melt"],
       "snippet": "..."
-    }
-  ],
-  "excluded_keyword_matches": [
-    {
-      "path": "generated/snow_model.generated.py",
-      "reason": "generated directory: generated",
-      "matched_keywords": ["snow", "melt"],
-      "distinct_keywords_matched": 2
     }
   ],
   "usage_guidance": "Prefer source files over docs when scores are similar. Prefer files with multiple distinct keywords and clustered hits. Use the snippets to decide which files deserve deeper reading. If the returned context is insufficient, fall back to normal repository context search."
@@ -162,26 +143,21 @@ Ranking is explainable rather than opaque. Signals include:
 
 This means a source file with a relevant `def`, `class`, `function`, `struct`, or similar declaration can outrank a doc file with many incidental mentions.
 
-### Excluded Matching Files
+### Bounded Results
 
-The result also includes `excluded_keyword_matches`.
+The result is intentionally not exhaustive.
 
-This list is for files that matched one or more search keywords but were not ranked because they were filtered out during discovery, for example due to:
+`quick-search` returns the top ranked files and bounded snippets only. It does not return every file that was eligible for ranking, and it does not return filtered files that were skipped during discovery.
 
-- generated directories or generated filename patterns
-- vendor directories
-- binary extensions or binary content
-- file size above the configured maximum
+If you need broader coverage, raise the budgets or fall back to normal repository context search.
 
-This makes exclusions auditable so a potentially important file is not silently omitted.
+## Directory Resolution
 
-### Omitted Ranked Files
+For agents, the safe contract is simple: always pass an absolute repository path.
 
-The result also includes `omitted_ranked_files`.
+Relative paths are not reliable because MCP servers do not automatically know the caller's current working directory. Some clients expose workspace roots and let `quick-search` resolve `.` against those roots, but others do not. In those clients, a relative path will fail rather than silently searching the wrong directory.
 
-This list contains files that were eligible, matched keywords, and were fully scored, but were not returned in `ranked_files` because of `max_files`.
-
-Use this list to audit coverage when you intentionally run with tight result budgets.
+Use relative paths only if you control the client and know it exposes roots. Otherwise, pass an absolute `directory`.
 
 ## Running The Server
 
@@ -315,12 +291,10 @@ Each search logs:
 - target root directory
 - query keywords
 - files considered, ranked, and returned
-- ranked matches omitted by `max_files`
 - snippets returned
 - whether budgets truncated the result
 - top-ranked files
 - per-file snippet coverage as `shown_lines=<returned>/<total> (<percent>%)`
-- excluded matching files with their exclusion reasons
 
 Example log lines:
 

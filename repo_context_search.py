@@ -186,14 +186,6 @@ class FileRecord:
     score: float = 0.0
     reason: str = ""
 
-
-@dataclass(slots=True)
-class ExcludedFileRecord:
-    path: Path
-    relative_path: str
-    reason: str
-
-
 @dataclass(slots=True)
 class SnippetWindow:
     start: int
@@ -228,15 +220,8 @@ def search_repo_context_result(
     if not root.exists() or not root.is_dir():
         raise ValueError(f"directory does not exist or is not a directory: {root}")
 
-    file_paths, excluded_paths = _discover_candidate_files(
-        root, max_file_size_bytes=max_file_size_bytes
-    )
+    file_paths = _discover_candidate_files(root, max_file_size_bytes=max_file_size_bytes)
     records = _collect_matches(root, file_paths, normalized_keywords)
-    excluded_keyword_matches = _collect_excluded_keyword_matches(
-        root,
-        excluded_paths,
-        normalized_keywords,
-    )
     _rank_records(
         records,
         keyword_count=len(normalized_keywords),
@@ -260,9 +245,7 @@ def search_repo_context_result(
         files_considered=len(file_paths),
         records=records,
         ranked_records=ranked_records,
-        omitted_ranked_records=omitted_ranked_records,
         snippets=snippets,
-        excluded_keyword_matches=excluded_keyword_matches,
         budget_truncated=budget_truncated,
     )
 
@@ -272,9 +255,7 @@ def search_repo_context_result(
             "files_considered": len(file_paths),
             "files_ranked": len(records),
             "files_returned": len(ranked_records),
-            "omitted_ranked_files": len(omitted_ranked_records),
             "snippets_returned": len(snippets),
-            "excluded_keyword_matches": len(excluded_keyword_matches),
             "budget_truncated": budget_truncated,
         },
         "ranked_files": [
@@ -290,19 +271,7 @@ def search_repo_context_result(
             }
             for index, record in enumerate(ranked_records)
         ],
-        "omitted_ranked_files": [
-            {
-                "path": record.relative_path,
-                "is_source_file": record.classification.is_source_file,
-                "keyword_hits": record.keyword_hits,
-                "distinct_keywords_matched": len(record.distinct_keywords),
-                "score": round(record.score, 3),
-                "reason": record.reason,
-            }
-            for record in omitted_ranked_records
-        ],
         "snippets": snippets,
-        "excluded_keyword_matches": excluded_keyword_matches,
         "usage_guidance": GUIDANCE,
     }
 
@@ -321,36 +290,26 @@ def _normalize_keywords(keywords: list[str]) -> list[str]:
 def _discover_candidate_files(
     root: Path,
     max_file_size_bytes: int,
-) -> tuple[list[Path], list[ExcludedFileRecord]]:
+) -> list[Path]:
     rg_path = shutil.which("rg")
     raw_paths = _discover_with_ripgrep(root, rg_path) if rg_path else None
     if raw_paths is None:
         raw_paths = _discover_with_walk(root)
 
     candidates: list[Path] = []
-    excluded: list[ExcludedFileRecord] = []
     for relative_path in raw_paths:
         path = root / relative_path
         if not path.is_file():
             continue
-        exclusion_reason = _excluded_reason_for_path(
+        if _excluded_reason_for_path(
             relative_path,
             path,
             max_file_size_bytes=max_file_size_bytes,
-        )
-        if exclusion_reason is not None:
-            excluded.append(
-                ExcludedFileRecord(
-                    path=path,
-                    relative_path=relative_path.as_posix(),
-                    reason=exclusion_reason,
-                )
-            )
+        ) is not None:
             continue
         candidates.append(path)
     candidates.sort()
-    excluded.sort(key=lambda record: record.relative_path)
-    return candidates, excluded
+    return candidates
 
 
 def _discover_with_ripgrep(root: Path, rg_path: str | None) -> list[Path] | None:
@@ -440,34 +399,6 @@ def _collect_matches(
         if records is not None:
             return records
     return _collect_matches_with_python(keywords, eligible)
-
-
-def _collect_excluded_keyword_matches(
-    root: Path,
-    excluded_paths: list[ExcludedFileRecord],
-    keywords: list[str],
-) -> list[dict[str, Any]]:
-    if not excluded_paths:
-        return []
-
-    excluded_by_path = {record.relative_path: record for record in excluded_paths}
-    eligible = {record.relative_path: record.path for record in excluded_paths}
-    rg_path = shutil.which("rg")
-    if rg_path is not None:
-        matched_keywords_by_path = _collect_keyword_presence_with_ripgrep(
-            root,
-            keywords,
-            eligible,
-            rg_path,
-            treat_binary_as_text=True,
-        )
-        if matched_keywords_by_path is not None:
-            return _format_excluded_keyword_matches(
-                excluded_by_path, matched_keywords_by_path
-            )
-
-    matched_keywords_by_path = _collect_keyword_presence_with_python(eligible, keywords)
-    return _format_excluded_keyword_matches(excluded_by_path, matched_keywords_by_path)
 
 
 def _collect_matches_with_ripgrep(
@@ -592,118 +523,6 @@ def _collect_matches_with_python(
     return records
 
 
-def _collect_keyword_presence_with_ripgrep(
-    root: Path,
-    keywords: list[str],
-    eligible: dict[str, Path],
-    rg_path: str,
-    *,
-    treat_binary_as_text: bool,
-) -> dict[str, set[str]] | None:
-    matched_keywords_by_path: dict[str, set[str]] = {}
-    eligible_paths = sorted(eligible)
-    for keyword in keywords:
-        for index in range(0, len(eligible_paths), 200):
-            batch = eligible_paths[index : index + 200]
-            command = [rg_path, "-l", "-i", "-F", "--color", "never"]
-            if treat_binary_as_text:
-                command.append("--text")
-            command.extend(["-e", keyword])
-            command.extend(batch)
-            completed = subprocess.run(
-                command,
-                cwd=root,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            if completed.returncode not in (0, 1):
-                return None
-            for raw_line in completed.stdout.splitlines():
-                relative_path = Path(raw_line).as_posix()
-                if relative_path in eligible:
-                    matched_keywords_by_path.setdefault(relative_path, set()).add(
-                        keyword
-                    )
-    return matched_keywords_by_path
-
-
-def _collect_keyword_presence_with_python(
-    eligible: dict[str, Path],
-    keywords: list[str],
-) -> dict[str, set[str]]:
-    encoded_keywords = {
-        keyword: keyword.lower().encode("utf-8", errors="ignore")
-        for keyword in keywords
-        if keyword
-    }
-    matched_keywords_by_path: dict[str, set[str]] = {}
-    for relative_path, path in eligible.items():
-        matched_keywords = _file_keyword_presence(path, encoded_keywords)
-        if matched_keywords:
-            matched_keywords_by_path[relative_path] = matched_keywords
-    return matched_keywords_by_path
-
-
-def _file_keyword_presence(
-    path: Path,
-    encoded_keywords: dict[str, bytes],
-    chunk_size: int = 64 * 1024,
-) -> set[str]:
-    if not encoded_keywords:
-        return set()
-
-    remaining = {
-        keyword: keyword_bytes
-        for keyword, keyword_bytes in encoded_keywords.items()
-        if keyword_bytes
-    }
-    if not remaining:
-        return set()
-
-    max_keyword_len = max(len(keyword_bytes) for keyword_bytes in remaining.values())
-    matched: set[str] = set()
-    carry = b""
-    try:
-        with path.open("rb") as handle:
-            while remaining:
-                chunk = handle.read(chunk_size)
-                if not chunk:
-                    break
-                haystack = (carry + chunk).lower()
-                for keyword, keyword_bytes in list(remaining.items()):
-                    if keyword_bytes in haystack:
-                        matched.add(keyword)
-                        del remaining[keyword]
-                if max_keyword_len > 1:
-                    carry = haystack[-(max_keyword_len - 1) :]
-                else:
-                    carry = b""
-    except OSError:
-        return set()
-    return matched
-
-
-def _format_excluded_keyword_matches(
-    excluded_by_path: dict[str, ExcludedFileRecord],
-    matched_keywords_by_path: dict[str, set[str]],
-) -> list[dict[str, Any]]:
-    def sort_key(item: tuple[str, set[str]]) -> tuple[int, str]:
-        relative_path, matched_keywords = item
-        return (-len(matched_keywords), relative_path)
-
-    return [
-        {
-            "path": relative_path,
-            "reason": excluded_by_path[relative_path].reason,
-            "matched_keywords": sorted(matched_keywords),
-            "distinct_keywords_matched": len(matched_keywords),
-        }
-        for relative_path, matched_keywords in sorted(
-            matched_keywords_by_path.items(),
-            key=sort_key,
-        )
-    ]
 
 
 def _compile_keyword_patterns(keywords: list[str]) -> dict[str, re.Pattern[str]]:
@@ -928,9 +747,7 @@ def _log_search_summary(
     files_considered: int,
     records: list[FileRecord],
     ranked_records: list[FileRecord],
-    omitted_ranked_records: list[FileRecord],
     snippets: list[dict[str, Any]],
-    excluded_keyword_matches: list[dict[str, Any]],
     budget_truncated: bool,
 ) -> None:
     coverage_by_path: dict[str, dict[str, int]] = {}
@@ -944,15 +761,13 @@ def _log_search_summary(
         coverage["snippet_count"] += 1
 
     LOGGER.info(
-        "repo search root=%s keywords=%s files_considered=%d files_ranked=%d files_returned=%d omitted_ranked_files=%d snippets_returned=%d excluded_keyword_matches=%d budget_truncated=%s",
+        "repo search root=%s keywords=%s files_considered=%d files_ranked=%d files_returned=%d snippets_returned=%d budget_truncated=%s",
         root,
         ", ".join(keywords),
         files_considered,
         len(records),
         len(ranked_records),
-        len(omitted_ranked_records),
         len(snippets),
-        len(excluded_keyword_matches),
         budget_truncated,
     )
     if not ranked_records:
@@ -980,22 +795,6 @@ def _log_search_summary(
             shown_lines,
             record.line_count,
             shown_percent,
-        )
-    for excluded in excluded_keyword_matches[:5]:
-        LOGGER.info(
-            "excluded path=%s reason=%s matched_keywords=%s",
-            excluded["path"],
-            excluded["reason"],
-            ", ".join(excluded["matched_keywords"]),
-        )
-    for omitted in omitted_ranked_records[:5]:
-        LOGGER.info(
-            "omitted path=%s score=%.3f hits=%d distinct_keywords=%d reason=%s",
-            omitted.relative_path,
-            omitted.score,
-            omitted.keyword_hits,
-            len(omitted.distinct_keywords),
-            omitted.reason,
         )
 
 
