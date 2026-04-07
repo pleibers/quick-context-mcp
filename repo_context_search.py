@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
 import logging
-from pathlib import Path
 import re
 import shutil
 import subprocess
+from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 DEFAULT_MAX_FILE_SIZE_BYTES = 1_000_000
@@ -94,9 +94,7 @@ GENERATED_FILE_PATTERNS = (
     re.compile(r"^package-lock\.json$", re.IGNORECASE),
 )
 DEFINITION_PATTERNS = {
-    ".py": (
-        re.compile(r"^\s*(async\s+def|def|class)\s+\w+", re.IGNORECASE),
-    ),
+    ".py": (re.compile(r"^\s*(async\s+def|def|class)\s+\w+", re.IGNORECASE),),
     ".jl": (
         re.compile(
             r"^\s*(function|struct|mutable\s+struct|abstract\s+type|module)\b",
@@ -230,17 +228,22 @@ def search_repo_context_result(
     if not root.exists() or not root.is_dir():
         raise ValueError(f"directory does not exist or is not a directory: {root}")
 
-    file_paths, excluded_paths = _discover_candidate_files(root, max_file_size_bytes=max_file_size_bytes)
+    file_paths, excluded_paths = _discover_candidate_files(
+        root, max_file_size_bytes=max_file_size_bytes
+    )
     records = _collect_matches(root, file_paths, normalized_keywords)
     excluded_keyword_matches = _collect_excluded_keyword_matches(
         root,
         excluded_paths,
         normalized_keywords,
     )
-    _rank_records(records, keyword_count=len(normalized_keywords), prefer_source_files=prefer_source_files)
+    _rank_records(
+        records,
+        keyword_count=len(normalized_keywords),
+        prefer_source_files=prefer_source_files,
+    )
 
     ranked_records = records[:max_files]
-    omitted_ranked_records = records[max_files:]
     budget_truncated = len(records) > len(ranked_records)
     snippets, snippet_budget_truncated = _extract_snippets(
         ranked_records=ranked_records,
@@ -281,7 +284,8 @@ def search_repo_context_result(
                 "keyword_hits": record.keyword_hits,
                 "distinct_keywords_matched": len(record.distinct_keywords),
                 "score": round(record.score, 3),
-                "recommended_read": index < min(5, max_files) or record.definition_hits > 0,
+                "recommended_read": index < min(5, max_files)
+                or record.definition_hits > 0,
                 "reason": record.reason,
             }
             for index, record in enumerate(ranked_records)
@@ -426,7 +430,9 @@ def _is_binary_file(path: Path) -> bool:
     return b"\0" in sample
 
 
-def _collect_matches(root: Path, file_paths: list[Path], keywords: list[str]) -> list[FileRecord]:
+def _collect_matches(
+    root: Path, file_paths: list[Path], keywords: list[str]
+) -> list[FileRecord]:
     eligible = {path.relative_to(root).as_posix(): path for path in file_paths}
     rg_path = shutil.which("rg")
     if rg_path is not None:
@@ -456,7 +462,9 @@ def _collect_excluded_keyword_matches(
             treat_binary_as_text=True,
         )
         if matched_keywords_by_path is not None:
-            return _format_excluded_keyword_matches(excluded_by_path, matched_keywords_by_path)
+            return _format_excluded_keyword_matches(
+                excluded_by_path, matched_keywords_by_path
+            )
 
     matched_keywords_by_path = _collect_keyword_presence_with_python(eligible, keywords)
     return _format_excluded_keyword_matches(excluded_by_path, matched_keywords_by_path)
@@ -499,7 +507,9 @@ def _collect_matches_with_ripgrep(
             matched_keywords, match_count = _line_match_details(line_text, compiled)
             if not matched_keywords:
                 continue
-            definition_hit = _has_definition_hit(relative_path, line_text, matched_keywords)
+            definition_hit = _has_definition_hit(
+                relative_path, line_text, matched_keywords
+            )
             record = records_by_path.setdefault(
                 relative_path,
                 FileRecord(
@@ -543,10 +553,14 @@ def _collect_matches_with_python(
             with path.open("r", encoding="utf-8", errors="replace") as handle:
                 for line_count, raw_line in enumerate(handle, start=1):
                     line_text = raw_line.rstrip("\n")
-                    matched_keywords, match_count = _line_match_details(line_text, compiled)
+                    matched_keywords, match_count = _line_match_details(
+                        line_text, compiled
+                    )
                     if not matched_keywords:
                         continue
-                    definition_hit = _has_definition_hit(relative_path, line_text, matched_keywords)
+                    definition_hit = _has_definition_hit(
+                        relative_path, line_text, matched_keywords
+                    )
                     matches.append(
                         MatchRecord(
                             line_number=line_count,
@@ -608,7 +622,9 @@ def _collect_keyword_presence_with_ripgrep(
             for raw_line in completed.stdout.splitlines():
                 relative_path = Path(raw_line).as_posix()
                 if relative_path in eligible:
-                    matched_keywords_by_path.setdefault(relative_path, set()).add(keyword)
+                    matched_keywords_by_path.setdefault(relative_path, set()).add(
+                        keyword
+                    )
     return matched_keywords_by_path
 
 
@@ -692,8 +708,7 @@ def _format_excluded_keyword_matches(
 
 def _compile_keyword_patterns(keywords: list[str]) -> dict[str, re.Pattern[str]]:
     return {
-        keyword: re.compile(re.escape(keyword), re.IGNORECASE)
-        for keyword in keywords
+        keyword: re.compile(re.escape(keyword), re.IGNORECASE) for keyword in keywords
     }
 
 
@@ -715,18 +730,32 @@ def _classify_path(relative_path: str) -> FileClassification:
     path = Path(relative_path)
     suffix = path.suffix.lower()
     path_text = path.as_posix().lower()
-    is_test = bool(TEST_PATH_RE.search(path_text)) or path.stem.lower().startswith("test_") or path.stem.lower().endswith("_test")
+    is_test = (
+        bool(TEST_PATH_RE.search(path_text))
+        or path.stem.lower().startswith("test_")
+        or path.stem.lower().endswith("_test")
+    )
     if suffix in SOURCE_EXTENSIONS:
         category = "test" if is_test else "source"
-        return FileClassification(category=category, is_source_file=True, is_test_file=is_test)
+        return FileClassification(
+            category=category, is_source_file=True, is_test_file=is_test
+        )
     if suffix in DOC_EXTENSIONS or path.name.lower().startswith("readme"):
-        return FileClassification(category="doc", is_source_file=False, is_test_file=False)
+        return FileClassification(
+            category="doc", is_source_file=False, is_test_file=False
+        )
     if suffix in CONFIG_EXTENSIONS:
-        return FileClassification(category="config", is_source_file=False, is_test_file=False)
-    return FileClassification(category="other", is_source_file=False, is_test_file=is_test)
+        return FileClassification(
+            category="config", is_source_file=False, is_test_file=False
+        )
+    return FileClassification(
+        category="other", is_source_file=False, is_test_file=is_test
+    )
 
 
-def _has_definition_hit(relative_path: str, line_text: str, matched_keywords: set[str]) -> bool:
+def _has_definition_hit(
+    relative_path: str, line_text: str, matched_keywords: set[str]
+) -> bool:
     stripped = line_text.strip()
     if not stripped:
         return False
@@ -756,16 +785,24 @@ def _rank_records(
     if not records:
         return
     max_hits = max(record.keyword_hits for record in records)
-    max_density = max(record.keyword_hits / max(record.line_count, 1) for record in records)
+    max_density = max(
+        record.keyword_hits / max(record.line_count, 1) for record in records
+    )
     max_definition_hits = max(record.definition_hits for record in records)
     for record in records:
         hit_score = record.keyword_hits / max_hits if max_hits else 0.0
-        distinct_score = len(record.distinct_keywords) / keyword_count if keyword_count else 0.0
+        distinct_score = (
+            len(record.distinct_keywords) / keyword_count if keyword_count else 0.0
+        )
         density = record.keyword_hits / max(record.line_count, 1)
         density_score = density / max_density if max_density else 0.0
         definition_score = 0.0
         if record.definition_hits:
-            scaled = record.definition_hits / max_definition_hits if max_definition_hits else 1.0
+            scaled = (
+                record.definition_hits / max_definition_hits
+                if max_definition_hits
+                else 1.0
+            )
             definition_score = min(1.0, 0.5 + 0.5 * scaled)
 
         source_bonus = _source_bonus(record.classification, prefer_source_files)
@@ -792,7 +829,9 @@ def _rank_records(
     )
 
 
-def _source_bonus(classification: FileClassification, prefer_source_files: bool) -> float:
+def _source_bonus(
+    classification: FileClassification, prefer_source_files: bool
+) -> float:
     if classification.is_source_file and not classification.is_test_file:
         return 1.0 if prefer_source_files else 0.8
     if classification.is_source_file and classification.is_test_file:
@@ -926,7 +965,9 @@ def _log_search_summary(
             {"shown_lines": 0, "snippet_count": 0},
         )
         shown_lines = coverage["shown_lines"]
-        shown_percent = 0.0 if record.line_count == 0 else (shown_lines / record.line_count) * 100.0
+        shown_percent = (
+            0.0 if record.line_count == 0 else (shown_lines / record.line_count) * 100.0
+        )
         LOGGER.info(
             "rank=%d path=%s score=%.3f hits=%d distinct_keywords=%d definition_hits=%d snippets=%d shown_lines=%d/%d (%.1f%%)",
             index,
@@ -1001,7 +1042,9 @@ def _build_snippet_windows(
             group_hits = [group[0]]
             start = max(1, group[0].line_number - lines_before)
             end = min(line_count, start + max_window_lines - 1)
-        matched_keywords = set().union(*(match.matched_keywords for match in group_hits))
+        matched_keywords = set().union(
+            *(match.matched_keywords for match in group_hits)
+        )
         match_count = sum(match.match_count for match in group_hits)
         window_length = max(1, end - start + 1)
         windows.append(
@@ -1033,7 +1076,11 @@ def _select_anchor_line(group: list[MatchRecord]) -> int:
         return definition_hits[0].line_number
     richest_match = max(
         group,
-        key=lambda match: (len(match.matched_keywords), match.match_count, -match.line_number),
+        key=lambda match: (
+            len(match.matched_keywords),
+            match.match_count,
+            -match.line_number,
+        ),
     )
     return richest_match.line_number
 
