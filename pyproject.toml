@@ -1,0 +1,13 @@
+[project]
+name = "quick-search"
+version = "0.1.0"
+description = "MCP server for bounded keyword-driven repository context search"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "mcp[cli]>=1.27.0",
+]
+
+[project.scripts]
+quick-search = "main:main"
