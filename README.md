@@ -39,6 +39,100 @@ The result is compact structured JSON with:
 - snippet excerpts
 - short usage guidance for the calling agent
 
+## Registering The MCP
+
+You might need to install [uv](https://docs.astral.sh/uv/) for this to work. Then download this repository. And either edit the config.toml yourself or use the one line commands below. Running it with uv is highly recommended.
+
+### Codex
+
+Direct Python launch:
+
+
+With `uv`:
+
+```bash
+codex mcp add quick-search -- \
+  uv run --directory path/to/repository python main.py
+```
+
+
+```bash
+codex mcp add quick-search -- \
+  path/to/repository/.venv/bin/python \
+  path/to/repository/main.py
+```
+
+Useful checks:
+
+```bash
+codex mcp list
+codex mcp get quick-search
+```
+
+### Claude Code
+
+Local scope:
+
+```bash
+claude mcp add quick-search --scope local -- \
+    uv run --directory path/to/repository python main.py
+```
+
+Project scope:
+
+```bash
+claude mcp add quick-search --scope project -- \
+  uv run --directory path/to/repository pyhton main.py
+```
+
+Equivalent `.mcp.json` entry:
+
+```json
+{
+  "mcpServers": {
+    "quick-search": {
+      "command": "uv",
+      "args" = ["run", "--directory", "/home/leibersp/code/quick-mcp", "python","main.py"],
+      "env": {}
+    }
+  }
+}
+```
+
+## Configuration
+
+You can configure default retrieval budgets at MCP registration time with environment variables:
+
+```bash
+QUICK_SEARCH_MAX_FILES=20
+QUICK_SEARCH_MAX_SNIPPETS=30
+QUICK_SEARCH_MAX_TOTAL_LINES=500
+QUICK_SEARCH_LOG_LEVEL=INFO
+```
+
+Behavior:
+
+- `QUICK_SEARCH_MAX_FILES` sets the default `max_files`
+- `QUICK_SEARCH_MAX_SNIPPETS` sets the default `max_snippets`
+- `QUICK_SEARCH_MAX_TOTAL_LINES` sets the default `max_total_lines`
+- `QUICK_SEARCH_LOG_LEVEL` controls Python logging verbosity
+
+Per-call tool arguments still override the retrieval defaults.
+
+Example Codex registration with configured defaults:
+
+```bash
+codex mcp add quick-search \
+  --env QUICK_SEARCH_MAX_FILES=20 \
+  --env QUICK_SEARCH_MAX_SNIPPETS=30 \
+  --env QUICK_SEARCH_MAX_TOTAL_LINES=500 \
+  --env QUICK_SEARCH_LOG_LEVEL=INFO \
+  -- \
+  path/to/repository/.venv/bin/python \
+  path/to/repository/main.py
+```
+
+
 ## Retrieval Behavior
 
 The implementation follows the broad-context retrieval plan in [broad-context-mcp-plan.md](path/to/repository/broad-context-mcp-plan.md).
@@ -359,97 +453,6 @@ MCP_TRANSPORT=stdio
 ```
 
 That is the correct default for Codex and Claude Code local MCP registration.
-
-## Registering The MCP
-
-### Codex
-
-Direct Python launch:
-
-```bash
-codex mcp add quick-search -- \
-  path/to/repository/.venv/bin/python \
-  path/to/repository/main.py
-```
-
-With `uv`:
-
-```bash
-codex mcp add quick-search -- \
-  uv run --directory path/to/repository python main.py
-```
-
-Useful checks:
-
-```bash
-codex mcp list
-codex mcp get quick-search
-```
-
-### Claude Code
-
-Local scope:
-
-```bash
-claude mcp add quick-search --scope local -- \
-  path/to/repository/.venv/bin/python \
-  path/to/repository/main.py
-```
-
-Project scope:
-
-```bash
-claude mcp add quick-search --scope project -- \
-  path/to/repository/.venv/bin/python \
-  path/to/repository/main.py
-```
-
-Equivalent `.mcp.json` entry:
-
-```json
-{
-  "mcpServers": {
-    "quick-search": {
-      "command": "path/to/repository/.venv/bin/python",
-      "args": ["path/to/repository/main.py"],
-      "env": {}
-    }
-  }
-}
-```
-
-## Configuration
-
-You can configure default retrieval budgets at MCP registration time with environment variables:
-
-```bash
-QUICK_SEARCH_MAX_FILES=20
-QUICK_SEARCH_MAX_SNIPPETS=30
-QUICK_SEARCH_MAX_TOTAL_LINES=500
-QUICK_SEARCH_LOG_LEVEL=INFO
-```
-
-Behavior:
-
-- `QUICK_SEARCH_MAX_FILES` sets the default `max_files`
-- `QUICK_SEARCH_MAX_SNIPPETS` sets the default `max_snippets`
-- `QUICK_SEARCH_MAX_TOTAL_LINES` sets the default `max_total_lines`
-- `QUICK_SEARCH_LOG_LEVEL` controls Python logging verbosity
-
-Per-call tool arguments still override the retrieval defaults.
-
-Example Codex registration with configured defaults:
-
-```bash
-codex mcp add quick-search \
-  --env QUICK_SEARCH_MAX_FILES=20 \
-  --env QUICK_SEARCH_MAX_SNIPPETS=30 \
-  --env QUICK_SEARCH_MAX_TOTAL_LINES=500 \
-  --env QUICK_SEARCH_LOG_LEVEL=INFO \
-  -- \
-  path/to/repository/.venv/bin/python \
-  path/to/repository/main.py
-```
 
 ## Logging
 
