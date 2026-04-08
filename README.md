@@ -41,7 +41,7 @@ The result is compact structured JSON with:
 
 ## Retrieval Behavior
 
-The implementation follows the broad-context retrieval plan in [broad-context-mcp-plan.md](/home/leibersp/code/quick-mcp/broad-context-mcp-plan.md).
+The implementation follows the broad-context retrieval plan in [broad-context-mcp-plan.md](path/to/repository/broad-context-mcp-plan.md).
 
 Current behavior includes:
 
@@ -345,7 +345,7 @@ If your local `uv` setup is stable, this is the simplest command.
 If you want a more explicit launch command:
 
 ```bash
-/home/leibersp/code/quick-mcp/.venv/bin/python /home/leibersp/code/quick-mcp/main.py
+path/to/repository/.venv/bin/python path/to/repository/main.py
 ```
 
 This is often the safer registration target for MCP clients because it avoids extra resolver and cache behavior at process startup.
@@ -368,15 +368,15 @@ Direct Python launch:
 
 ```bash
 codex mcp add quick-search -- \
-  /home/leibersp/code/quick-mcp/.venv/bin/python \
-  /home/leibersp/code/quick-mcp/main.py
+  path/to/repository/.venv/bin/python \
+  path/to/repository/main.py
 ```
 
 With `uv`:
 
 ```bash
 codex mcp add quick-search -- \
-  uv run --directory /home/leibersp/code/quick-mcp python main.py
+  uv run --directory path/to/repository python main.py
 ```
 
 Useful checks:
@@ -392,16 +392,16 @@ Local scope:
 
 ```bash
 claude mcp add quick-search --scope local -- \
-  /home/leibersp/code/quick-mcp/.venv/bin/python \
-  /home/leibersp/code/quick-mcp/main.py
+  path/to/repository/.venv/bin/python \
+  path/to/repository/main.py
 ```
 
 Project scope:
 
 ```bash
 claude mcp add quick-search --scope project -- \
-  /home/leibersp/code/quick-mcp/.venv/bin/python \
-  /home/leibersp/code/quick-mcp/main.py
+  path/to/repository/.venv/bin/python \
+  path/to/repository/main.py
 ```
 
 Equivalent `.mcp.json` entry:
@@ -410,8 +410,8 @@ Equivalent `.mcp.json` entry:
 {
   "mcpServers": {
     "quick-search": {
-      "command": "/home/leibersp/code/quick-mcp/.venv/bin/python",
-      "args": ["/home/leibersp/code/quick-mcp/main.py"],
+      "command": "path/to/repository/.venv/bin/python",
+      "args": ["path/to/repository/main.py"],
       "env": {}
     }
   }
@@ -447,8 +447,8 @@ codex mcp add quick-search \
   --env QUICK_SEARCH_MAX_TOTAL_LINES=500 \
   --env QUICK_SEARCH_LOG_LEVEL=INFO \
   -- \
-  /home/leibersp/code/quick-mcp/.venv/bin/python \
-  /home/leibersp/code/quick-mcp/main.py
+  path/to/repository/.venv/bin/python \
+  path/to/repository/main.py
 ```
 
 ## Logging
@@ -482,11 +482,11 @@ QUICK_SEARCH_LOG_LEVEL=WARNING
 
 ### Project Layout
 
-- [main.py](/home/leibersp/code/quick-mcp/main.py): process entrypoint and logging setup
-- [quick_search.py](/home/leibersp/code/quick-mcp/quick_search.py): FastMCP server and tool registration
-- [repo_context_search.py](/home/leibersp/code/quick-mcp/repo_context_search.py): retrieval, ranking, and snippet extraction engine
-- [tests/test_repo_context_search.py](/home/leibersp/code/quick-mcp/tests/test_repo_context_search.py): unit tests
-- [broad-context-mcp-plan.md](/home/leibersp/code/quick-mcp/broad-context-mcp-plan.md): implementation plan
+- [main.py](path/to/repository/main.py): process entrypoint and logging setup
+- [quick_search.py](path/to/repository/quick_search.py): FastMCP server and tool registration
+- [repo_context_search.py](path/to/repository/repo_context_search.py): retrieval, ranking, and snippet extraction engine
+- [tests/test_repo_context_search.py](path/to/repository/tests/test_repo_context_search.py): unit tests
+- [broad-context-mcp-plan.md](path/to/repository/broad-context-mcp-plan.md): implementation plan
 
 ### Install / Sync
 
