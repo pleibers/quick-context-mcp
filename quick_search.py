@@ -10,24 +10,33 @@ from mcp.server.fastmcp import Context, FastMCP
 from repo_context_search import search_repo_context_result
 
 SERVER_INSTRUCTIONS = (
-    "quick-search provides bounded repository retrieval for keyword-driven codebase "
+    "quick-search provides bounded repository retrieval for keyword-driven or "
+    "prompt-driven codebase "
     "exploration. Use search_repo_context when you want likely relevant files and "
     "small, targeted snippets instead of reading whole files. The tool searches the "
     "current working directory by default, or an explicitly provided directory, then "
-    "discovers candidate files, skips obvious noise such as generated files, vendor "
-    "directories, binaries, and very large files, ranks matches using explainable "
-    "signals such as keyword hits, distinct keyword coverage, source-file preference, "
-    "keyword density, and likely symbol-definition matches, and returns only bounded "
-    "snippet windows around the strongest hits. Prefer the ranked_files list to "
-    "decide what deserves deeper inspection, and use snippets as triage context "
-    "rather than as a complete file view. The result is intentionally not exhaustive: "
-    "it does not contain all files that might be eligible for context, especially "
-    "when ranking and snippet budgets are tight. For agent use, pass an absolute "
-    "directory path. Relative directory values such as '.' are only a best-effort "
-    "fallback when the MCP client exposes roots, and must not be relied on across "
-    "clients. This tool is best for broad repo search, feature discovery, symbol "
-    "hunting, and narrowing a large codebase before normal reads. If the returned "
-    "context is insufficient, default back to normal repository context search."
+    "discovers candidate files, optionally restricts search to a subtree or globbed "
+    "path set, skips obvious noise such as generated files, vendor directories, "
+    "binaries, and very large files, ranks matches using explainable signals such as "
+    "keyword hits, distinct keyword coverage, source-file preference, keyword "
+    "density, and likely symbol-definition matches, and returns only bounded snippet "
+    "windows around the strongest hits. Prefer the ranked_files list to decide what "
+    "deserves deeper inspection, and use snippets as triage context rather than as a "
+    "complete file view. The result is intentionally not exhaustive: it does not "
+    "contain all files that might be eligible for context, especially when ranking "
+    "and snippet budgets are tight. For agent use, pass an absolute directory path. "
+    "Relative directory values such as '.' are only a best-effort fallback when the "
+    "MCP client exposes roots, and must not be relied on across clients. This tool "
+    "can derive a bounded keyword set from prompt text and returns the resolved "
+    "query terms for transparency. Agent workflow: start with output_mode='compact' "
+    "and include_diagnostics=false to keep context small; if the result looks "
+    "promising but you need more ranking or query detail, reuse the returned "
+    "query_id with output_mode='full' to expand the cached result without "
+    "recomputing; if you need to debug empty or surprising results, reuse the same "
+    "query_id with include_diagnostics=true. It is best for broad repo search, "
+    "feature discovery, symbol hunting, and narrowing a large codebase before "
+    "normal reads. Only do further searches across the repository if this context "
+    "is insufficient."
 )
 
 DEFAULT_MAX_FILES = 12
@@ -43,25 +52,40 @@ mcp = FastMCP(
 @mcp.tool(
     name="search_repo_context",
     description=(
-        "Search a repository with one or more exact keywords, rank likely relevant "
+        "Search a repository with explicit keywords or a prompt, rank likely relevant "
         "files without reading full files, and return bounded snippets around the "
         "strongest clustered matches. The tool prefers source files over docs when "
         "scores are similar, boosts likely function, class, struct, module, or method "
         "definition hits, merges overlapping match windows, and enforces hard budgets "
-        "on returned files, snippets, and total lines. Use it to narrow a large repo "
-        "before deeper inspection. It returns structured output with summary counts, "
-        "ranked files, snippets, and usage guidance. Pass an absolute directory path "
-        "for reliable agent behavior. Relative directory values such as '.' only "
-        "work when the MCP client exposes roots, so they are not portable across "
-        "clients. The result is bounded and does not necessarily include every file "
-        "that could be relevant for context. If the bounded result is not enough, "
-        "fall back to normal repository context search."
+        "on returned files, snippets, and total lines. Optional subtree and glob "
+        "filters can narrow the search space before ranking. Matching defaults to "
+        "substring mode, with optional word and identifier-aware modes for stricter "
+        "code search. Prompt-derived keyword expansion is heuristic, bounded, and "
+        "returned transparently in the output. Preferred agent workflow: call the "
+        "tool in compact mode first, then expand the cached result by query_id in "
+        "full mode only if you need richer metadata; enable diagnostics only for "
+        "debugging or tuning. Use it to narrow a large repo before deeper "
+        "inspection. It returns structured output with summary counts, ranked files, "
+        "snippets, and usage guidance. Pass an absolute directory path for reliable "
+        "agent behavior. Relative directory values such as '.' only work when the "
+        "MCP client exposes roots, so they are not portable across clients. The "
+        "result is bounded and does not necessarily include every file that could be "
+        "relevant for context. Only do further searches across the repository if "
+        "this context is insufficient."
     ),
     structured_output=True,
 )
 async def search_repo_context(
-    keywords: list[str],
+    keywords: list[str] | None = None,
+    prompt: str | None = None,
+    query_id: str | None = None,
     directory: str | None = None,
+    subpath: str | None = None,
+    paths_include_glob: str | None = None,
+    paths_exclude_glob: str | None = None,
+    match_mode: str = "substring",
+    include_diagnostics: bool = False,
+    output_mode: str = "compact",
     max_files: int | None = None,
     max_snippets: int | None = None,
     lines_before: int = 8,
@@ -73,10 +97,30 @@ async def search_repo_context(
     """Return ranked file candidates and bounded snippets for keyword-driven repo search.
 
     Args:
-        keywords: One or more non-empty exact keywords to search for.
+        keywords: Optional explicit keywords to search for.
+        prompt: Optional prompt text from which a bounded keyword set will be
+            derived. Explicit keywords are preserved and prompt-derived terms
+            are added transparently.
+        query_id: Optional cached result id returned by a prior call. When
+            provided, the cached search result is rendered again with the
+            requested output_mode and diagnostics settings without recomputing
+            the search. This is the preferred way to expand a compact result.
         directory: Root directory to search. Pass an absolute path for reliable
             agent behavior. Relative paths only work when the MCP client exposes
             roots.
+        subpath: Optional subtree or single file within directory to search.
+            Must be relative to directory.
+        paths_include_glob: Optional glob that candidate file paths must match,
+            relative to directory.
+        paths_exclude_glob: Optional glob that candidate file paths must not
+            match, relative to directory.
+        match_mode: Matching mode for keywords. Use `substring` for current
+            behavior, `word` for word-boundary matching, or `identifier` for
+            snake_case and camelCase token matching.
+        include_diagnostics: Whether to include compact backend and exclusion
+            diagnostics in the response.
+        output_mode: Response verbosity. Use `compact` for lean agent context
+            or `full` for richer ranking and snippet metadata.
         max_files: Maximum number of ranked files to return.
         max_snippets: Maximum number of snippet windows to return across all files.
         lines_before: Context lines to include before each selected match window.
@@ -92,7 +136,15 @@ async def search_repo_context(
     resolved_directory = await _resolve_directory(directory, ctx)
     return search_repo_context_result(
         keywords=keywords,
+        prompt=prompt,
+        query_id=query_id,
         directory=resolved_directory,
+        subpath=subpath,
+        paths_include_glob=paths_include_glob,
+        paths_exclude_glob=paths_exclude_glob,
+        match_mode=match_mode,
+        include_diagnostics=include_diagnostics,
+        output_mode=output_mode,
         max_files=_get_int_env("QUICK_SEARCH_MAX_FILES", max_files, DEFAULT_MAX_FILES),
         max_snippets=_get_int_env(
             "QUICK_SEARCH_MAX_SNIPPETS",

@@ -82,6 +82,272 @@ class SearchRepoContextTests(unittest.TestCase):
             self.assertIn("docs/snow-notes.md", returned_paths)
             self.assertIn("tests/test_snow_model.py", returned_paths)
 
+    def test_exposes_richer_ranked_file_and_snippet_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "snow_model.py").write_text(
+                "\n".join(
+                    [
+                        "def snow_melt_balance(snowpack, melt_factor):",
+                        "    return snowpack * melt_factor",
+                        "snow_value = snow_melt_balance(2.0, 0.5)",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["snow", "melt"],
+                directory=str(root),
+                lines_before=0,
+                lines_after=0,
+                output_mode="full",
+            )
+
+            ranked = result["ranked_files"][0]
+            self.assertEqual(ranked["category"], "source")
+            self.assertFalse(ranked["is_test_file"])
+            self.assertEqual(ranked["line_count"], 3)
+            self.assertEqual(ranked["definition_hits"], 1)
+            self.assertAlmostEqual(ranked["keyword_density"], 3.0, places=6)
+
+            snippet = result["snippets"][0]
+            self.assertEqual(snippet["match_count"], 4)
+            self.assertTrue(snippet["has_definition_hit"])
+
+    def test_word_match_mode_rejects_partial_token_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "model.py").write_text(
+                "\n".join(
+                    [
+                        "snowpack = 1",
+                        "snow = 2",
+                        "snow_model = 3",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["snow"],
+                directory=str(root),
+                match_mode="word",
+                lines_before=0,
+                lines_after=0,
+            )
+
+            self.assertEqual(result["ranked_files"][0]["keyword_hits"], 1)
+            self.assertEqual(len(result["snippets"]), 1)
+            self.assertIn("snow = 2", result["snippets"][0]["snippet"])
+
+    def test_identifier_match_mode_matches_snake_and_camel_case(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "model.py").write_text(
+                "\n".join(
+                    [
+                        "snowModel = 1",
+                        "snow_model = 2",
+                        "snowfall = 3",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["snow"],
+                directory=str(root),
+                match_mode="identifier",
+                lines_before=0,
+                lines_after=0,
+            )
+
+            self.assertEqual(result["ranked_files"][0]["keyword_hits"], 2)
+            self.assertEqual(result["snippets"][0]["matched_keywords"], ["snow"])
+            self.assertNotIn("snowfall = 3", result["snippets"][0]["snippet"])
+
+    def test_rejects_invalid_match_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with self.assertRaisesRegex(
+                ValueError,
+                "match_mode must be one of",
+            ):
+                search_repo_context_result(
+                    keywords=["snow"],
+                    directory=str(root),
+                    match_mode="bad-mode",
+                )
+
+    def test_prompt_only_query_derives_keywords_and_finds_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "snow_model.py").write_text(
+                "def snow_melt_balance():\n    return 1\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                prompt="find the snow melt balance implementation",
+                directory=str(root),
+            )
+
+            self.assertTrue(result["query"]["prompt_used"])
+            self.assertIn("snow", result["query"]["resolved_keywords"])
+            self.assertIn("melt", result["query"]["resolved_keywords"])
+            self.assertEqual(result["ranked_files"][0]["path"], "src/snow_model.py")
+
+    def test_prompt_terms_are_added_after_explicit_keywords(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "snow_model.py").write_text(
+                "def snow_melt_balance():\n    return 1\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["balance"],
+                prompt="find the snow melt balance implementation",
+                directory=str(root),
+                output_mode="full",
+            )
+
+            self.assertEqual(result["query"]["explicit_keywords"], ["balance"])
+            self.assertEqual(result["query"]["resolved_keywords"][0], "balance")
+            self.assertIn("snow", result["query"]["resolved_keywords"])
+            self.assertIn("melt", result["query"]["resolved_keywords"])
+
+    def test_prompt_derived_keywords_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = search_repo_context_result(
+                prompt=(
+                    "please find the snow melt energy balance temperature runoff albedo "
+                    "density grain metamorphism compaction conductivity implementation"
+                ),
+                directory=tmpdir,
+                output_mode="full",
+            )
+
+            self.assertLessEqual(len(result["query"]["derived_keywords"]), 8)
+            self.assertLessEqual(len(result["query"]["resolved_keywords"]), 8)
+
+    def test_prompt_identifier_terms_are_tokenized(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "model.py").write_text(
+                "snowModel = 1\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                prompt="inspect `snowModel` handling",
+                directory=str(root),
+                match_mode="identifier",
+            )
+
+            self.assertIn("snow", result["query"]["resolved_keywords"])
+            self.assertIn("model", result["query"]["resolved_keywords"])
+            self.assertEqual(result["ranked_files"][0]["path"], "src/model.py")
+
+    def test_requires_keywords_or_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with self.assertRaisesRegex(
+                ValueError,
+                "provide at least one non-empty keyword or a prompt",
+            ):
+                search_repo_context_result(directory=str(root))
+
+    def test_compact_output_omits_full_metadata_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "snow_model.py").write_text(
+                "def snow_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["snow"],
+                directory=str(root),
+            )
+
+            ranked = result["ranked_files"][0]
+            self.assertNotIn("is_source_file", ranked)
+            self.assertNotIn("is_test_file", ranked)
+            self.assertNotIn("line_count", ranked)
+            self.assertNotIn("keyword_density", ranked)
+            snippet = result["snippets"][0]
+            self.assertNotIn("match_count", snippet)
+            self.assertNotIn("has_definition_hit", snippet)
+            self.assertEqual(sorted(result["query"].keys()), ["prompt_used", "resolved_keywords"])
+            self.assertIn("query_id", result)
+
+    def test_includes_diagnostics_when_requested(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "snow_model.py").write_text(
+                "def snow_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+            (root / "tests" / "test_snow.py").write_text(
+                "def test_snow_component():\n    assert True\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["snow"],
+                directory=str(root),
+                paths_exclude_glob="tests/*",
+                include_diagnostics=True,
+            )
+
+            self.assertIn("diagnostics", result)
+            self.assertIn(result["diagnostics"]["discovery_backend"], {"ripgrep", "walk"})
+            self.assertIn(result["diagnostics"]["matching_backend"], {"ripgrep", "python"})
+            self.assertEqual(result["diagnostics"]["excluded_file_counts"]["exclude_glob"], 1)
+
+    def test_can_expand_cached_compact_result_by_query_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "snow_model.py").write_text(
+                "def snow_melt_balance():\n    return 1\n",
+                encoding="utf-8",
+            )
+
+            compact = search_repo_context_result(
+                keywords=["snow", "melt"],
+                directory=str(root),
+                output_mode="compact",
+            )
+            expanded = search_repo_context_result(
+                query_id=compact["query_id"],
+                output_mode="full",
+                include_diagnostics=True,
+            )
+
+            self.assertEqual(expanded["query_id"], compact["query_id"])
+            self.assertIn("is_source_file", expanded["ranked_files"][0])
+            self.assertIn("match_count", expanded["snippets"][0])
+            self.assertIn("diagnostics", expanded)
+
+    def test_rejects_unknown_query_id(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unknown query_id"):
+            search_repo_context_result(query_id="does-not-exist")
+
     def test_merges_overlapping_windows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -167,6 +433,7 @@ class SearchRepoContextTests(unittest.TestCase):
             result = search_repo_context_result(
                 keywords=["snow", "melt"],
                 directory=str(root),
+                output_mode="full",
             )
 
             ranked_paths = [item["path"] for item in result["ranked_files"]]
@@ -186,7 +453,10 @@ class SearchRepoContextTests(unittest.TestCase):
 
             self.assertEqual(result["ranked_files"], [])
             self.assertEqual(result["snippets"], [])
-            self.assertIn("fall back to normal repository context search", result["usage_guidance"])
+            self.assertIn(
+                "Only do further searches across the repository if this context is insufficient.",
+                result["usage_guidance"],
+            )
 
     def test_returns_docs_when_only_docs_match(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -205,7 +475,7 @@ class SearchRepoContextTests(unittest.TestCase):
             )
 
             self.assertEqual(result["ranked_files"][0]["path"], "docs/snow.md")
-            self.assertFalse(result["ranked_files"][0]["is_source_file"])
+            self.assertEqual(result["ranked_files"][0]["category"], "doc")
 
     def test_uses_cwd_when_directory_is_omitted(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -265,6 +535,145 @@ class SearchRepoContextTests(unittest.TestCase):
             "relative directory paths such as '.' are not reliable across MCP clients",
         ):
             asyncio.run(search_repo_context(keywords=["snow"], directory="."))
+
+    def test_restricts_search_to_subpath_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "docs").mkdir()
+            (root / "src" / "snow_model.py").write_text(
+                "def snow_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "snow.md").write_text(
+                "snow guidance\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["snow"],
+                directory=str(root),
+                subpath="src",
+            )
+
+            self.assertEqual(result["summary"]["files_considered"], 1)
+            self.assertEqual(result["ranked_files"][0]["path"], "src/snow_model.py")
+
+    def test_restricts_search_to_subpath_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "snow_model.py").write_text(
+                "def snow_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+            (root / "src" / "melt_model.py").write_text(
+                "def melt_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["snow", "melt"],
+                directory=str(root),
+                subpath="src/snow_model.py",
+            )
+
+            self.assertEqual(result["summary"]["files_considered"], 1)
+            self.assertEqual(
+                [item["path"] for item in result["ranked_files"]],
+                ["src/snow_model.py"],
+            )
+
+    def test_filters_candidates_with_include_glob(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "docs").mkdir()
+            (root / "src" / "snow_model.py").write_text(
+                "def snow_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "snow.md").write_text(
+                "snow guidance\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["snow"],
+                directory=str(root),
+                paths_include_glob="src/*.py",
+            )
+
+            self.assertEqual(result["summary"]["files_considered"], 1)
+            self.assertEqual(result["ranked_files"][0]["path"], "src/snow_model.py")
+
+    def test_filters_candidates_with_exclude_glob(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            (root / "src" / "snow_model.py").write_text(
+                "def snow_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+            (root / "tests" / "test_snow.py").write_text(
+                "def test_snow_component():\n    assert True\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["snow"],
+                directory=str(root),
+                paths_exclude_glob="tests/*",
+            )
+
+            self.assertEqual(result["summary"]["files_considered"], 1)
+            self.assertEqual(result["ranked_files"][0]["path"], "src/snow_model.py")
+
+    def test_combines_subpath_and_glob_filters(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "nested").mkdir()
+            (root / "src" / "nested" / "snow_model.py").write_text(
+                "def snow_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+            (root / "src" / "nested" / "snow_notes.md").write_text(
+                "snow notes\n",
+                encoding="utf-8",
+            )
+            (root / "src" / "other.py").write_text(
+                "def snow_other():\n    return 1\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["snow"],
+                directory=str(root),
+                subpath="src/nested",
+                paths_include_glob="src/nested/*.py",
+                paths_exclude_glob="*.md",
+            )
+
+            self.assertEqual(result["summary"]["files_considered"], 1)
+            self.assertEqual(
+                [item["path"] for item in result["ranked_files"]],
+                ["src/nested/snow_model.py"],
+            )
+
+    def test_rejects_invalid_subpath(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            with self.assertRaisesRegex(
+                ValueError,
+                "subpath does not exist within directory",
+            ):
+                search_repo_context_result(
+                    keywords=["snow"],
+                    directory=str(root),
+                    subpath="missing",
+                )
 
     def test_tool_reads_budget_defaults_from_environment(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
