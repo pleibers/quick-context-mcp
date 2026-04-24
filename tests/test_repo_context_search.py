@@ -6,8 +6,8 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from quick_search import search_repo_context
-from repo_context_search import search_repo_context_result
+from quick_search import search_focused_context, search_repo_context
+from repo_context_search import focused_context_result, search_repo_context_result
 
 
 class SearchRepoContextTests(unittest.TestCase):
@@ -186,7 +186,7 @@ class SearchRepoContextTests(unittest.TestCase):
                     match_mode="bad-mode",
                 )
 
-    def test_prompt_only_query_derives_keywords_and_finds_matches(self) -> None:
+    def test_phrase_keyword_expands_to_more_general_terms(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "src").mkdir()
@@ -196,51 +196,53 @@ class SearchRepoContextTests(unittest.TestCase):
             )
 
             result = search_repo_context_result(
-                prompt="find the snow melt balance implementation",
-                directory=str(root),
-            )
-
-            self.assertTrue(result["query"]["prompt_used"])
-            self.assertIn("snow", result["query"]["resolved_keywords"])
-            self.assertIn("melt", result["query"]["resolved_keywords"])
-            self.assertEqual(result["ranked_files"][0]["path"], "src/snow_model.py")
-
-    def test_prompt_terms_are_added_after_explicit_keywords(self) -> None:
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            (root / "src").mkdir()
-            (root / "src" / "snow_model.py").write_text(
-                "def snow_melt_balance():\n    return 1\n",
-                encoding="utf-8",
-            )
-
-            result = search_repo_context_result(
-                keywords=["balance"],
-                prompt="find the snow melt balance implementation",
+                keywords=["snow melt balance"],
                 directory=str(root),
                 output_mode="full",
             )
 
-            self.assertEqual(result["query"]["explicit_keywords"], ["balance"])
-            self.assertEqual(result["query"]["resolved_keywords"][0], "balance")
+            self.assertEqual(result["query"]["keywords"], ["snow melt balance"])
             self.assertIn("snow", result["query"]["resolved_keywords"])
             self.assertIn("melt", result["query"]["resolved_keywords"])
+            self.assertIn("balance", result["query"]["resolved_keywords"])
+            self.assertEqual(result["ranked_files"][0]["path"], "src/snow_model.py")
 
-    def test_prompt_derived_keywords_are_bounded(self) -> None:
+    def test_input_keyword_matches_outrank_expanded_term_hits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "docs").mkdir()
+            (root / "src" / "snow_model.py").write_text(
+                "def snow_melt_balance():\n    return 1\n",
+                encoding="utf-8",
+            )
+            (root / "docs" / "snow_notes.md").write_text(
+                "\n".join(["snow notes"] * 40) + "\n",
+                encoding="utf-8",
+            )
+
+            result = search_repo_context_result(
+                keywords=["snow melt balance"],
+                directory=str(root),
+            )
+
+            self.assertEqual(result["ranked_files"][0]["path"], "src/snow_model.py")
+            self.assertIn("input keyword matches", result["ranked_files"][0]["reason"])
+
+    def test_keyword_expansion_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             result = search_repo_context_result(
-                prompt=(
-                    "please find the snow melt energy balance temperature runoff albedo "
-                    "density grain metamorphism compaction conductivity implementation"
-                ),
+                keywords=[
+                    "snow melt energy balance temperature runoff albedo density grain",
+                    "metamorphism compaction conductivity",
+                ],
                 directory=tmpdir,
                 output_mode="full",
             )
 
-            self.assertLessEqual(len(result["query"]["derived_keywords"]), 8)
             self.assertLessEqual(len(result["query"]["resolved_keywords"]), 8)
 
-    def test_prompt_identifier_terms_are_tokenized(self) -> None:
+    def test_phrase_keyword_identifier_terms_are_tokenized(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             (root / "src").mkdir()
@@ -250,21 +252,22 @@ class SearchRepoContextTests(unittest.TestCase):
             )
 
             result = search_repo_context_result(
-                prompt="inspect `snowModel` handling",
+                keywords=["snow model handling"],
                 directory=str(root),
                 match_mode="identifier",
+                output_mode="full",
             )
 
             self.assertIn("snow", result["query"]["resolved_keywords"])
             self.assertIn("model", result["query"]["resolved_keywords"])
             self.assertEqual(result["ranked_files"][0]["path"], "src/model.py")
 
-    def test_requires_keywords_or_prompt(self) -> None:
+    def test_requires_keywords(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             with self.assertRaisesRegex(
                 ValueError,
-                "provide at least one non-empty keyword or a prompt",
+                "provide at least one non-empty keyword",
             ):
                 search_repo_context_result(directory=str(root))
 
@@ -290,7 +293,7 @@ class SearchRepoContextTests(unittest.TestCase):
             snippet = result["snippets"][0]
             self.assertNotIn("match_count", snippet)
             self.assertNotIn("has_definition_hit", snippet)
-            self.assertEqual(sorted(result["query"].keys()), ["prompt_used", "resolved_keywords"])
+            self.assertEqual(sorted(result["query"].keys()), ["keywords", "resolved_keywords"])
             self.assertIn("query_id", result)
 
     def test_includes_diagnostics_when_requested(self) -> None:
@@ -343,6 +346,166 @@ class SearchRepoContextTests(unittest.TestCase):
             self.assertIn("is_source_file", expanded["ranked_files"][0])
             self.assertIn("match_count", expanded["snippets"][0])
             self.assertIn("diagnostics", expanded)
+
+    def test_focused_context_returns_full_python_blocks_across_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "snow.py").write_text(
+                "\n".join(
+                    [
+                        "def helper():",
+                        "    return 0",
+                        "",
+                        "def snow_melt_balance():",
+                        "    snow = compute_snow()",
+                        "    melt = compute_melt()",
+                        "    return snow + melt",
+                        "",
+                        "def tail():",
+                        "    return 1",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "src" / "energy.py").write_text(
+                "\n".join(
+                    [
+                        "def energy_helper():",
+                        "    return 0",
+                        "",
+                        "def energy_balance_component():",
+                        "    melt = latent_heat_flux()",
+                        "    return melt",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            broad = search_repo_context_result(
+                keywords=["snow melt balance"],
+                directory=str(root),
+                output_mode="full",
+            )
+            focused = focused_context_result(
+                query_id=broad["query_id"],
+                max_files=2,
+                max_blocks=4,
+                max_blocks_per_file=2,
+            )
+
+            self.assertEqual(focused["summary"]["files_with_context"], 2)
+            self.assertGreaterEqual(len(focused["blocks"]), 2)
+            first_block = focused["blocks"][0]
+            self.assertEqual(first_block["path"], "src/snow.py")
+            self.assertEqual(first_block["signature"], "def snow_melt_balance():")
+            self.assertIn("return snow + melt", first_block["content"])
+            self.assertNotIn("def tail():", first_block["content"])
+
+    def test_focused_context_tool_reuses_query_id(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "model.py").write_text(
+                "def snow_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+            broad = search_repo_context_result(
+                keywords=["snow component"],
+                directory=str(root),
+            )
+
+            focused = asyncio.run(
+                search_focused_context(
+                    query_id=broad["query_id"],
+                    max_files=1,
+                    max_blocks=1,
+                )
+            )
+
+            self.assertEqual(focused["query_id"], broad["query_id"])
+            self.assertEqual(focused["blocks"][0]["path"], "src/model.py")
+            self.assertEqual(focused["blocks"][0]["signature"], "def snow_component():")
+
+    def test_focused_context_can_run_standalone_from_keywords(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "snow.py").write_text(
+                "\n".join(
+                    [
+                        "def helper():",
+                        "    return 0",
+                        "",
+                        "def snow_melt_balance():",
+                        "    melt = 1",
+                        "    return melt",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            focused = focused_context_result(
+                keywords=["snow melt balance"],
+                directory=str(root),
+                max_files=1,
+                max_blocks=1,
+            )
+
+            self.assertIn("query_id", focused)
+            self.assertEqual(focused["candidate_files"], ["src/snow.py"])
+            self.assertEqual(focused["blocks"][0]["signature"], "def snow_melt_balance():")
+            self.assertIn("return melt", focused["blocks"][0]["content"])
+
+    def test_focused_context_tool_can_run_standalone_from_keywords(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "model.py").write_text(
+                "def snow_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+
+            focused = asyncio.run(
+                search_focused_context(
+                    keywords=["snow component"],
+                    directory=str(root),
+                    max_files=1,
+                    max_blocks=1,
+                )
+            )
+
+            self.assertEqual(focused["blocks"][0]["path"], "src/model.py")
+            self.assertEqual(focused["blocks"][0]["signature"], "def snow_component():")
+
+    def test_focused_context_can_use_explicit_file_paths_without_broad_ranking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "src").mkdir()
+            (root / "src" / "snow.py").write_text(
+                "def snow_component():\n    return 1\n",
+                encoding="utf-8",
+            )
+            (root / "src" / "melt.py").write_text(
+                "def melt_component():\n    return 2\n",
+                encoding="utf-8",
+            )
+
+            focused = focused_context_result(
+                keywords=["melt component"],
+                directory=str(root),
+                file_paths=["src/melt.py"],
+                max_files=1,
+                max_blocks=1,
+            )
+
+            self.assertEqual(focused["candidate_files"], ["src/melt.py"])
+            self.assertEqual(len(focused["blocks"]), 1)
+            self.assertEqual(focused["blocks"][0]["path"], "src/melt.py")
+            self.assertEqual(focused["blocks"][0]["signature"], "def melt_component():")
 
     def test_rejects_unknown_query_id(self) -> None:
         with self.assertRaisesRegex(ValueError, "unknown query_id"):

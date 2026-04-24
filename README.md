@@ -2,9 +2,10 @@
 
 `quick-search` is a FastMCP server for bounded, keyword-driven repository context search. It is designed for broad codebase exploration when a client needs likely-relevant files and small, targeted snippets instead of reading whole files.
 
-The server exposes a single MCP tool:
+The server exposes two MCP tools:
 
 - `search_repo_context`
+- `search_focused_context`
 
 It is intended for agent workflows such as:
 
@@ -18,8 +19,11 @@ Recommended agent workflow:
 1. Call `search_repo_context` with `output_mode="compact"` and `include_diagnostics=false`.
 2. Keep the returned `query_id`.
 3. If the result identifies promising files but you need more ranking or query metadata, call the tool again with `query_id=<prior id>` and `output_mode="full"`.
-4. If the result is empty or surprising, call the tool again with `query_id=<prior id>` and `include_diagnostics=true`.
-5. Once the search is narrowed, switch to Serena or normal file reads.
+4. If the relevant context is spread across a few files, call `search_focused_context` with that same `query_id` to retrieve full enclosing definitions instead of snippets.
+5. If you already know the specific keyword you want and want enclosing definitions directly, call `search_focused_context` on its own with `keywords`.
+6. If you already know both the keyword and the exact files, call `search_focused_context` with `keywords` and `file_paths` to skip broad ranking entirely.
+7. If the result is empty or surprising, call the broad tool again with `query_id=<prior id>` and `include_diagnostics=true`.
+8. Once the search is narrowed, switch to Serena or normal file reads.
 
 ## What It Does
 
@@ -30,13 +34,15 @@ For each request, `quick-search`:
 3. counts keyword hits per file
 4. boosts likely source files and symbol-definition matches
 5. ranks files with an explainable score
-6. returns only bounded snippet windows around strong matches
+6. returns bounded snippet windows around strong matches
+7. optionally returns full enclosing multi-file code blocks in a second focused step
 
 The result is compact structured JSON with:
 
 - summary counts
 - ranked files
 - snippet excerpts
+- focused code blocks when requested
 - short usage guidance for the calling agent
 
 ## Registering The MCP
@@ -143,7 +149,7 @@ Current behavior includes:
 - optional `subpath` restriction to a subtree or single file within `directory`
 - optional include/exclude glob filters on candidate file paths
 - `match_mode` with `substring`, `word`, and `identifier` behavior
-- optional `prompt` input with bounded heuristic keyword expansion
+- bounded keyword expansion from the provided `keywords`
 - `output_mode` with compact-by-default responses
 - optional `include_diagnostics` for backend and exclusion summaries
 - `rg --files` discovery when available, with Python fallback
@@ -160,10 +166,10 @@ The server intentionally does not do embeddings, AST parsing, or semantic rerank
 Default retrieval limits:
 
 - `max_files = 12`
-- `max_snippets = 24`
-- `lines_before = 8`
-- `lines_after = 12`
-- `max_total_lines = 400`
+- `max_snippets = 8`
+- `lines_before = 24`
+- `lines_after = 40`
+- `max_total_lines = 1200`
 
 Internal implementation defaults also include:
 
@@ -172,6 +178,8 @@ Internal implementation defaults also include:
 
 ## Tool Contract
 
+### `search_repo_context`
+
 ### Input
 
 `search_repo_context` accepts:
@@ -179,7 +187,6 @@ Internal implementation defaults also include:
 ```json
 {
   "keywords": ["snow", "albedo", "melt"],
-  "prompt": "find the snow melt balance implementation",
   "query_id": null,
   "directory": "/path/to/repo",
   "subpath": "src/model",
@@ -189,19 +196,21 @@ Internal implementation defaults also include:
   "output_mode": "compact",
   "include_diagnostics": false,
   "max_files": 12,
-  "max_snippets": 24,
-  "lines_before": 8,
-  "lines_after": 12,
+  "max_snippets": 8,
+  "lines_before": 24,
+  "lines_after": 40,
   "prefer_source_files": true,
-  "max_total_lines": 400
+  "max_total_lines": 1200
 }
 ```
 
 Parameter notes:
 
-- provide at least one non-empty `keyword` or a non-empty `prompt`
+- provide at least one non-empty `keyword`
+- prefer specific phrases or identifiers over very general terms such as `snow` when possible
 - `query_id` may be used instead of rerunning the same search when you only want a different `output_mode` or diagnostics view
-- explicit `keywords` are preserved first; prompt-derived terms are added up to a bounded limit
+- provided `keywords` are preserved first; additional generalized terms may be added up to a bounded limit
+- ranking gives much more weight to matches on the original input keywords than to expansion-only matches
 - `directory` should be an absolute path for reliable agent behavior
 - `subpath` is optional and must be relative to `directory`
 - `subpath` may point to either a directory or a single file
@@ -232,12 +241,12 @@ Typical output shape:
     "files_considered": 1832,
     "files_ranked": 47,
     "files_returned": 12,
-    "snippets_returned": 24,
+    "snippets_returned": 8,
     "budget_truncated": true
   },
   "query": {
-    "prompt_used": true,
-    "resolved_keywords": ["snow", "albedo", "melt", "snow melt", "balance", "implementation"]
+    "keywords": ["snow melt balance"],
+    "resolved_keywords": ["snow melt balance", "snow", "melt", "balance", "snow melt", "melt balance"]
   },
   "ranked_files": [
     {
@@ -308,29 +317,31 @@ In `full` mode additional fields are included:
   - matches `snow` inside `snow_model` and `snowModel`
   - does not match `snow` inside `snowfall`
 
-## Prompt Queries
+## Keyword Expansion
 
-You can pass prompt text directly instead of hand-curating keyword lists.
+`quick-search` works from explicit keywords only.
 
-`quick-search` keeps this heuristic and bounded:
+It broadens those keywords in a bounded way so searches are not limited to exact
+literal matches:
 
-- extracts repeated technical terms
-- keeps useful identifier-like tokens
-- preserves some short technical phrases
+- keeps the original keyword first
+- extracts useful identifier-like tokens
+- preserves some short adjacent phrases
 - caps the final resolved keyword set
 
-The derived and resolved keywords are returned in the `query` object so the behavior
-is transparent to the caller.
+Expansion terms are meant as recall helpers, not primary ranking signals. Files
+that match the original input keywords should rank ahead of files that mostly
+match only generalized terms.
+
+The original and resolved keywords are returned in the `query` object so the
+behavior is transparent to the caller.
 
 In `compact` mode, `query` contains:
 
-- `prompt_used`
+- `keywords`
 - `resolved_keywords`
 
-In `full` mode, `query` also includes:
-
-- `explicit_keywords`
-- `derived_keywords`
+In `full` mode, the same keys are returned.
 
 ## Output Modes
 
@@ -346,7 +357,7 @@ Use `full` when:
 
 - you are tuning retrieval quality
 - you want ranking metadata for debugging or evaluation
-- you want to inspect explicit versus prompt-derived keywords
+- you want to inspect how your input keywords were generalized
 - you plan to immediately inspect only a small number of returned files
 
 ## Diagnostics
@@ -384,6 +395,83 @@ That id refers to an in-process cached full result:
 This avoids recomputing the same search just to retrieve richer metadata.
 
 This means a source file with a relevant `def`, `class`, `function`, `struct`, or similar declaration can outrank a doc file with many incidental mentions.
+
+### `search_focused_context`
+
+Use this only after `search_repo_context` when the relevant code is spread across
+multiple files and line snippets are no longer enough.
+
+Input:
+
+```json
+{
+  "query_id": "9e0a4f3f8e6b2c1d",
+  "keywords": null,
+  "directory": null,
+  "file_paths": null,
+  "max_files": 3,
+  "max_blocks": 6,
+  "max_blocks_per_file": 2,
+  "max_total_lines": 400
+}
+```
+
+Parameter notes:
+
+- provide either `query_id` or at least one non-empty `keyword`
+- use `query_id` when this is the second stage after `search_repo_context`
+- use `keywords` plus `directory` when you want focused retrieval directly without a prior broad-search call
+- use `keywords` plus `file_paths` when you want to skip broad ranking and search only specific files
+- omit `file_paths` to let the tool pick the strongest source files from the broad search
+- use `file_paths` when you want to constrain the focused pass to specific files from the broad result or standalone focused search
+- this tool is intended for multi-file code context, not broad discovery
+- it returns full enclosing definitions when possible and avoids returning whole files
+
+Typical output shape:
+
+```json
+{
+  "query_id": "9e0a4f3f8e6b2c1d",
+  "searched_directory": "/path/to/repo",
+  "query": {
+    "keywords": ["snow melt balance"],
+    "resolved_keywords": ["snow melt balance", "snow", "melt", "balance"]
+  },
+  "summary": {
+    "candidate_files_considered": 3,
+    "files_with_context": 2,
+    "blocks_returned": 4,
+    "budget_truncated": false
+  },
+  "candidate_files": ["src/snow.py", "src/energy.py"],
+  "blocks": [
+    {
+      "path": "src/snow.py",
+      "block_type": "function",
+      "signature": "def snow_melt_balance():",
+      "line_start": 12,
+      "line_end": 24,
+      "matched_keywords": ["balance", "melt", "snow"],
+      "match_lines": [12, 13, 18],
+      "score": 1.0,
+      "content": "def snow_melt_balance():\n    ..."
+    }
+  ]
+}
+```
+
+This second-stage tool is best when:
+
+- the broad search already found the right files
+- the relevant logic is distributed across a small number of files
+- you need complete functions or classes, not line windows
+- you want to avoid falling back immediately to unrestricted pattern search
+
+Direct-file mode is best when:
+
+- you already know the exact files to inspect
+- file ranking and broad discovery are unnecessary overhead
+- you still want enclosing functions or classes rather than whole files
 
 ### Bounded Results
 
@@ -527,8 +615,9 @@ The test suite currently covers:
 - subtree restriction
 - include/exclude glob filtering
 - `word` and `identifier` matching modes
-- prompt-derived keyword expansion
+- keyword expansion from explicit keywords
 - compact and full output modes
+- focused multi-file context extraction with full Python blocks
 - optional diagnostics output
 - overlapping snippet merge
 - total line budget enforcement

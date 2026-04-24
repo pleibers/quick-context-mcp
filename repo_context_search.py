@@ -214,6 +214,7 @@ class MatchRecord:
     line_number: int
     matched_keywords: set[str]
     match_count: int
+    input_keyword_hits: int
     definition_hit: bool
 
 
@@ -224,7 +225,10 @@ class FileRecord:
     classification: FileClassification
     line_count: int = 0
     keyword_hits: int = 0
+    weighted_keyword_hits: float = 0.0
+    input_keyword_hits: int = 0
     distinct_keywords: set[str] = field(default_factory=set)
+    distinct_input_keywords: set[str] = field(default_factory=set)
     definition_hits: int = 0
     matches: list[MatchRecord] = field(default_factory=list)
     score: float = 0.0
@@ -240,9 +244,25 @@ class SnippetWindow:
     density: float
 
 
+@dataclass(slots=True)
+class ContextBlock:
+    source_path: Path
+    path: str
+    start: int
+    end: int
+    block_type: str
+    signature: str
+    matched_keywords: set[str] = field(default_factory=set)
+    distinct_input_keywords: set[str] = field(default_factory=set)
+    input_keyword_hits: int = 0
+    keyword_hits: int = 0
+    definition_hits: int = 0
+    match_lines: set[int] = field(default_factory=set)
+    score: float = 0.0
+
+
 def search_repo_context_result(
     keywords: list[str] | None = None,
-    prompt: str | None = None,
     query_id: str | None = None,
     directory: str | None = None,
     subpath: str | None = None,
@@ -252,11 +272,11 @@ def search_repo_context_result(
     include_diagnostics: bool = False,
     output_mode: Literal["compact", "full"] = "compact",
     max_files: int = 12,
-    max_snippets: int = 24,
-    lines_before: int = 8,
-    lines_after: int = 12,
+    max_snippets: int = 8,
+    lines_before: int = 24,
+    lines_after: int = 40,
     prefer_source_files: bool = True,
-    max_total_lines: int = 400,
+    max_total_lines: int = 1200,
     max_snippets_per_file: int = DEFAULT_MAX_SNIPPETS_PER_FILE,
     max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
 ) -> dict[str, Any]:
@@ -270,10 +290,11 @@ def search_repo_context_result(
             include_diagnostics=include_diagnostics,
         )
 
-    query_details = _resolve_query_details(keywords, prompt)
+    query_details = _resolve_query_details(keywords)
+    input_keywords = query_details["keywords"]
     normalized_keywords = query_details["resolved_keywords"]
-    if not normalized_keywords:
-        raise ValueError("provide at least one non-empty keyword or a prompt")
+    if not input_keywords:
+        raise ValueError("provide at least one non-empty keyword")
     if match_mode not in {"substring", "word", "identifier"}:
         raise ValueError(
             "match_mode must be one of: substring, word, identifier"
@@ -298,10 +319,11 @@ def search_repo_context_result(
         max_file_size_bytes=max_file_size_bytes,
     )
     records, match_backend = _collect_matches(
-        root, file_paths, normalized_keywords, match_mode
+        root, file_paths, normalized_keywords, input_keywords, match_mode
     )
     _rank_records(
         records,
+        input_keyword_count=len(input_keywords),
         keyword_count=len(normalized_keywords),
         prefer_source_files=prefer_source_files,
     )
@@ -345,11 +367,13 @@ def search_repo_context_result(
             "matching_backend": match_backend,
             "excluded_file_counts": discovery_diagnostics["excluded_counts"],
         },
+        "search_config": {
+            "match_mode": match_mode,
+        },
     }
     canonical_query_id = _make_query_id(
         {
             "keywords": keywords or [],
-            "prompt": prompt or "",
             "resolved_keywords": normalized_keywords,
             "directory": str(root),
             "subpath": subpath or "",
@@ -375,6 +399,263 @@ def search_repo_context_result(
     )
 
 
+def focused_context_result(
+    query_id: str | None = None,
+    keywords: list[str] | None = None,
+    directory: str | None = None,
+    subpath: str | None = None,
+    paths_include_glob: str | None = None,
+    paths_exclude_glob: str | None = None,
+    match_mode: Literal["substring", "word", "identifier"] = "substring",
+    file_paths: list[str] | None = None,
+    max_files: int = 3,
+    max_blocks: int = 6,
+    max_blocks_per_file: int = 2,
+    max_total_lines: int = 400,
+) -> dict[str, Any]:
+    if max_files < 1 or max_blocks < 1 or max_blocks_per_file < 1 or max_total_lines < 1:
+        raise ValueError(
+            "max_files, max_blocks, max_blocks_per_file, and max_total_lines must be >= 1"
+        )
+    if query_id is None and not _normalize_keywords(keywords or []):
+        raise ValueError("provide either query_id or at least one non-empty keyword")
+
+    if query_id is None and file_paths:
+        return _focused_context_from_direct_files(
+            keywords=keywords or [],
+            directory=directory,
+            subpath=subpath,
+            paths_include_glob=paths_include_glob,
+            paths_exclude_glob=paths_exclude_glob,
+            match_mode=match_mode,
+            file_paths=file_paths,
+            max_files=max_files,
+            max_blocks=max_blocks,
+            max_blocks_per_file=max_blocks_per_file,
+            max_total_lines=max_total_lines,
+        )
+
+    if query_id is not None:
+        cached_result = _get_cached_result(query_id)
+        if cached_result is None:
+            raise ValueError(f"unknown query_id: {query_id}")
+    else:
+        cached_result = search_repo_context_result(
+            keywords=keywords,
+            directory=directory,
+            subpath=subpath,
+            paths_include_glob=paths_include_glob,
+            paths_exclude_glob=paths_exclude_glob,
+            match_mode=match_mode,
+            output_mode="full",
+            max_files=max(12, max_files),
+            max_snippets=1,
+            lines_before=0,
+            lines_after=0,
+            max_total_lines=1,
+        )
+        query_id = cached_result["query_id"]
+
+    root = Path(cached_result["searched_directory"])
+    query_details = cached_result["query"]
+    input_keywords = query_details["keywords"]
+    resolved_keywords = query_details["resolved_keywords"]
+    match_mode = cached_result.get("search_config", {}).get("match_mode", "substring")
+
+    selected_relative_paths = _select_focused_file_paths(
+        cached_result["ranked_files"],
+        file_paths=file_paths,
+        max_files=max_files,
+    )
+    selected_paths = [root / relative_path for relative_path in selected_relative_paths]
+    records, _backend = _collect_matches(
+        root,
+        selected_paths,
+        resolved_keywords,
+        input_keywords,
+        match_mode,
+    )
+    _rank_records(
+        records,
+        input_keyword_count=len(input_keywords),
+        keyword_count=len(resolved_keywords),
+        prefer_source_files=True,
+    )
+    blocks, budget_truncated = _extract_context_blocks(
+        records,
+        max_blocks=max_blocks,
+        max_blocks_per_file=max_blocks_per_file,
+        max_total_lines=max_total_lines,
+        input_keyword_count=len(input_keywords),
+    )
+    return {
+        "query_id": query_id,
+        "searched_directory": str(root),
+        "query": query_details,
+        "summary": {
+            "candidate_files_considered": len(selected_relative_paths),
+            "files_with_context": len({block["path"] for block in blocks}),
+            "blocks_returned": len(blocks),
+            "budget_truncated": budget_truncated,
+        },
+        "candidate_files": selected_relative_paths,
+        "blocks": blocks,
+        "usage_guidance": (
+            "Use this focused tool only after broad search when relevant context spans "
+            "multiple files. It returns full enclosing definitions when possible "
+            "instead of truncated snippets."
+        ),
+    }
+
+
+def _select_focused_file_paths(
+    ranked_files: list[dict[str, Any]],
+    file_paths: list[str] | None,
+    max_files: int,
+) -> list[str]:
+    if file_paths:
+        return _normalize_file_paths(file_paths)[:max_files]
+
+    selected: list[str] = []
+    for ranked_file in ranked_files:
+        category = ranked_file["category"]
+        if category not in {"source", "test"}:
+            continue
+        selected.append(ranked_file["path"])
+        if len(selected) >= max_files:
+            break
+    if selected:
+        return selected
+    return [ranked_file["path"] for ranked_file in ranked_files[:max_files]]
+
+
+def _normalize_file_paths(file_paths: list[str]) -> list[str]:
+    seen: set[str] = set()
+    normalized: list[str] = []
+    for file_path in file_paths:
+        candidate = file_path.strip().replace("\\", "/")
+        if candidate and candidate not in seen:
+            seen.add(candidate)
+            normalized.append(candidate)
+    return normalized
+
+
+def _focused_context_from_direct_files(
+    keywords: list[str],
+    directory: str | None,
+    subpath: str | None,
+    paths_include_glob: str | None,
+    paths_exclude_glob: str | None,
+    match_mode: Literal["substring", "word", "identifier"],
+    file_paths: list[str],
+    max_files: int,
+    max_blocks: int,
+    max_blocks_per_file: int,
+    max_total_lines: int,
+) -> dict[str, Any]:
+    root = Path(directory).expanduser().resolve() if directory else Path.cwd().resolve()
+    if not root.exists() or not root.is_dir():
+        raise ValueError(f"directory does not exist or is not a directory: {root}")
+
+    query_details = _resolve_query_details(keywords)
+    input_keywords = query_details["keywords"]
+    resolved_keywords = query_details["resolved_keywords"]
+    if not input_keywords:
+        raise ValueError("provide at least one non-empty keyword")
+
+    requested_paths = _normalize_file_paths(file_paths)[:max_files]
+    scope = _resolve_subpath(root, subpath)
+    scope_relative = scope.relative_to(root) if scope is not None else None
+    scope_is_file = scope.is_file() if scope is not None else False
+
+    selected_paths: list[Path] = []
+    selected_relative_paths: list[str] = []
+    for relative_path_text in requested_paths:
+        relative_path = Path(relative_path_text)
+        candidate = (root / relative_path).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError as exc:
+            raise ValueError(
+                f"file path escapes the search directory: {relative_path_text!r}"
+            ) from exc
+        if not candidate.exists() or not candidate.is_file():
+            raise ValueError(
+                f"file path does not exist within directory: {relative_path_text!r}"
+            )
+        normalized_relative = candidate.relative_to(root).as_posix()
+        if not _path_in_scope(Path(normalized_relative), scope_relative, scope_is_file):
+            raise ValueError(
+                f"file path is outside the requested subpath: {relative_path_text!r}"
+            )
+        glob_reason = _glob_exclusion_reason(
+            normalized_relative,
+            paths_include_glob=paths_include_glob,
+            paths_exclude_glob=paths_exclude_glob,
+        )
+        if glob_reason is not None:
+            raise ValueError(
+                f"file path is excluded by the provided glob filters: {relative_path_text!r}"
+            )
+        selected_paths.append(candidate)
+        selected_relative_paths.append(normalized_relative)
+
+    records, _backend = _collect_matches(
+        root,
+        selected_paths,
+        resolved_keywords,
+        input_keywords,
+        match_mode,
+    )
+    _rank_records(
+        records,
+        input_keyword_count=len(input_keywords),
+        keyword_count=len(resolved_keywords),
+        prefer_source_files=True,
+    )
+    blocks, budget_truncated = _extract_context_blocks(
+        records,
+        max_blocks=max_blocks,
+        max_blocks_per_file=max_blocks_per_file,
+        max_total_lines=max_total_lines,
+        input_keyword_count=len(input_keywords),
+    )
+    direct_query_id = _make_query_id(
+        {
+            "mode": "focused_direct",
+            "keywords": input_keywords,
+            "resolved_keywords": resolved_keywords,
+            "directory": str(root),
+            "subpath": subpath or "",
+            "paths_include_glob": paths_include_glob or "",
+            "paths_exclude_glob": paths_exclude_glob or "",
+            "match_mode": match_mode,
+            "file_paths": selected_relative_paths,
+            "max_files": max_files,
+            "max_blocks": max_blocks,
+            "max_blocks_per_file": max_blocks_per_file,
+            "max_total_lines": max_total_lines,
+        }
+    )
+    return {
+        "query_id": direct_query_id,
+        "searched_directory": str(root),
+        "query": query_details,
+        "summary": {
+            "candidate_files_considered": len(selected_relative_paths),
+            "files_with_context": len({block["path"] for block in blocks}),
+            "blocks_returned": len(blocks),
+            "budget_truncated": budget_truncated,
+        },
+        "candidate_files": selected_relative_paths,
+        "blocks": blocks,
+        "usage_guidance": (
+            "Direct-file focused mode skips broad ranking and searches only the "
+            "provided files for the requested keywords before returning enclosing blocks."
+        ),
+    }
+
+
 def _normalize_keywords(keywords: list[str]) -> list[str]:
     seen: set[str] = set()
     normalized: list[str] = []
@@ -388,75 +669,58 @@ def _normalize_keywords(keywords: list[str]) -> list[str]:
 
 def _resolve_query_details(
     keywords: list[str] | None,
-    prompt: str | None,
 ) -> dict[str, Any]:
     explicit_keywords = _normalize_keywords(keywords or [])
-    derived_keywords = _derive_keywords_from_prompt(prompt or "")
-    resolved_keywords = explicit_keywords[:]
-    for keyword in derived_keywords:
-        if keyword not in resolved_keywords:
-            resolved_keywords.append(keyword)
-        if len(resolved_keywords) >= DEFAULT_MAX_QUERY_TERMS:
-            break
+    resolved_keywords = _expand_keywords(explicit_keywords)
     return {
-        "prompt_used": bool(prompt and prompt.strip()),
-        "explicit_keywords": explicit_keywords,
-        "derived_keywords": derived_keywords,
+        "keywords": explicit_keywords,
         "resolved_keywords": resolved_keywords,
     }
 
 
-def _derive_keywords_from_prompt(prompt: str) -> list[str]:
-    stripped = prompt.strip()
-    if not stripped:
-        return []
+def _expand_keywords(keywords: list[str]) -> list[str]:
+    resolved_keywords: list[str] = []
+    seen: set[str] = set()
 
-    weighted_terms: list[str] = []
+    def add_keyword(term: str) -> bool:
+        cleaned = term.strip().lower()
+        if not cleaned or cleaned in seen:
+            return False
+        seen.add(cleaned)
+        resolved_keywords.append(cleaned)
+        return len(resolved_keywords) >= DEFAULT_MAX_QUERY_TERMS
 
-    backticked = re.findall(r"`([^`]+)`", stripped)
-    for phrase in backticked:
-        weighted_terms.extend(_extract_prompt_terms(phrase, extra_weight=3))
+    for keyword in keywords:
+        if add_keyword(keyword):
+            break
+        for variant in _keyword_variants(keyword):
+            if add_keyword(variant):
+                return resolved_keywords
 
-    weighted_terms.extend(_extract_prompt_terms(stripped, extra_weight=1))
-    counts = Counter(weighted_terms)
-    ranked_terms = [
-        term
-        for term, _count in sorted(
-            counts.items(),
-            key=lambda item: (-item[1], -len(item[0]), item[0]),
-        )
-    ]
-    return ranked_terms[:DEFAULT_MAX_QUERY_TERMS]
+    return resolved_keywords
 
 
-def _extract_prompt_terms(text: str, extra_weight: int) -> list[str]:
-    terms: list[str] = []
-    lowered_words = re.findall(r"[A-Za-z][A-Za-z0-9_/-]*", text.lower())
-    significant_words = [
-        word
-        for word in lowered_words
-        if word not in STOP_WORDS and (len(word) >= 3 or "_" in word or "/" in word or "-" in word)
-    ]
-
-    for word in significant_words:
-        terms.extend([word] * extra_weight)
-
-    for first, second in zip(significant_words, significant_words[1:], strict=False):
-        if first == second:
-            continue
-        phrase = f"{first} {second}"
-        terms.extend([phrase] * max(1, extra_weight - 1))
-
-    code_like_candidates = re.findall(r"[A-Za-z_][A-Za-z0-9_./-]*", text)
-    for candidate in code_like_candidates:
+def _keyword_variants(keyword: str) -> list[str]:
+    tokens: list[str] = []
+    for candidate in re.findall(r"[A-Za-z0-9_./-]+", keyword):
         lowered_candidate = candidate.lower()
-        if lowered_candidate not in STOP_WORDS and len(lowered_candidate) >= 3:
-            terms.extend([lowered_candidate] * extra_weight)
+        if _is_significant_query_term(lowered_candidate):
+            tokens.append(lowered_candidate)
         for token in _identifier_tokens(candidate):
-            if token not in STOP_WORDS and len(token) >= 3:
-                terms.extend([token] * extra_weight)
+            if _is_significant_query_term(token):
+                tokens.append(token)
 
-    return terms
+    variants = _normalize_keywords(tokens)
+    for first, second in zip(variants, variants[1:], strict=False):
+        if first != second:
+            variants.append(f"{first} {second}")
+    return _normalize_keywords(variants)
+
+
+def _is_significant_query_term(term: str) -> bool:
+    return term not in STOP_WORDS and (
+        len(term) >= 3 or "_" in term or "/" in term or "-" in term
+    )
 
 
 def _format_query_details(
@@ -465,7 +729,7 @@ def _format_query_details(
 ) -> dict[str, Any]:
     if output_mode == "compact":
         return {
-            "prompt_used": query_details["prompt_used"],
+            "keywords": query_details["keywords"],
             "resolved_keywords": query_details["resolved_keywords"],
         }
     return query_details
@@ -767,32 +1031,43 @@ def _collect_matches(
     root: Path,
     file_paths: list[Path],
     keywords: list[str],
+    input_keywords: list[str],
     match_mode: Literal["substring", "word", "identifier"],
 ) -> tuple[list[FileRecord], str]:
     eligible = {path.relative_to(root).as_posix(): path for path in file_paths}
     rg_path = shutil.which("rg")
     if rg_path is not None and match_mode == "substring":
-        records = _collect_matches_with_ripgrep(root, keywords, eligible, rg_path)
+        records = _collect_matches_with_ripgrep(
+            root, keywords, input_keywords, eligible, rg_path
+        )
         if records is not None:
             return records, "ripgrep"
-    return _collect_matches_with_python(keywords, eligible, match_mode), "python"
+    return (
+        _collect_matches_with_python(
+            keywords, input_keywords, eligible, match_mode
+        ),
+        "python",
+    )
 
 
 def _collect_matches_with_ripgrep(
     root: Path,
     keywords: list[str],
+    input_keywords: list[str],
     eligible: dict[str, Path],
     rg_path: str,
 ) -> list[FileRecord] | None:
     compiled = _compile_keyword_patterns(keywords, "substring")
     keyword_set = set(keywords)
+    input_keyword_set = set(input_keywords)
+    keyword_weights = _keyword_weights(keywords, input_keyword_set)
     records_by_path: dict[str, FileRecord] = {}
     eligible_paths = sorted(eligible)
     for index in range(0, len(eligible_paths), 200):
         batch = eligible_paths[index : index + 200]
         command = [rg_path, "--json", "-n", "-i", "--color", "never"]
         for keyword in keywords:
-            command.extend(["-e", re.escape(keyword)])
+            command.extend(["-e", _keyword_pattern_text(keyword)])
         command.extend(batch)
         completed = subprocess.run(
             command,
@@ -813,11 +1088,13 @@ def _collect_matches_with_ripgrep(
             data = event["data"]
             relative_path = Path(data["path"]["text"]).as_posix()
             line_text = data["lines"]["text"].rstrip("\n")
-            matched_keywords, match_count = _line_match_details(
+            matched_keywords, match_count, input_keyword_hits, weighted_match_hits = _line_match_details(
                 line_text,
                 compiled,
                 "substring",
                 keyword_set,
+                input_keyword_set,
+                keyword_weights,
             )
             if not matched_keywords:
                 continue
@@ -833,12 +1110,18 @@ def _collect_matches_with_ripgrep(
                 ),
             )
             record.keyword_hits += match_count
+            record.weighted_keyword_hits += weighted_match_hits
+            record.input_keyword_hits += input_keyword_hits
             record.distinct_keywords.update(matched_keywords)
+            record.distinct_input_keywords.update(
+                keyword for keyword in matched_keywords if keyword in input_keyword_set
+            )
             record.matches.append(
                 MatchRecord(
                     line_number=int(data["line_number"]),
                     matched_keywords=matched_keywords,
                     match_count=match_count,
+                    input_keyword_hits=input_keyword_hits,
                     definition_hit=definition_hit,
                 )
             )
@@ -853,27 +1136,40 @@ def _collect_matches_with_ripgrep(
 
 def _collect_matches_with_python(
     keywords: list[str],
+    input_keywords: list[str],
     eligible: dict[str, Path],
     match_mode: Literal["substring", "word", "identifier"],
 ) -> list[FileRecord]:
     compiled = _compile_keyword_patterns(keywords, match_mode)
     keyword_set = set(keywords)
+    input_keyword_set = set(input_keywords)
+    keyword_weights = _keyword_weights(keywords, input_keyword_set)
     records: list[FileRecord] = []
     for relative_path, path in eligible.items():
         matches: list[MatchRecord] = []
         keyword_hits = 0
+        weighted_keyword_hits = 0.0
+        input_keyword_hits = 0
         distinct_keywords: set[str] = set()
+        distinct_input_keywords: set[str] = set()
         definition_hits = 0
         line_count = 0
         try:
             with path.open("r", encoding="utf-8", errors="replace") as handle:
                 for line_count, raw_line in enumerate(handle, start=1):
                     line_text = raw_line.rstrip("\n")
-                    matched_keywords, match_count = _line_match_details(
+                    (
+                        matched_keywords,
+                        match_count,
+                        line_input_keyword_hits,
+                        weighted_match_hits,
+                    ) = _line_match_details(
                         line_text,
                         compiled,
                         match_mode,
                         keyword_set,
+                        input_keyword_set,
+                        keyword_weights,
                     )
                     if not matched_keywords:
                         continue
@@ -885,11 +1181,19 @@ def _collect_matches_with_python(
                             line_number=line_count,
                             matched_keywords=matched_keywords,
                             match_count=match_count,
+                            input_keyword_hits=line_input_keyword_hits,
                             definition_hit=definition_hit,
                         )
                     )
                     keyword_hits += match_count
+                    weighted_keyword_hits += weighted_match_hits
+                    input_keyword_hits += line_input_keyword_hits
                     distinct_keywords.update(matched_keywords)
+                    distinct_input_keywords.update(
+                        keyword
+                        for keyword in matched_keywords
+                        if keyword in input_keyword_set
+                    )
                     if definition_hit:
                         definition_hits += 1
         except OSError:
@@ -903,12 +1207,23 @@ def _collect_matches_with_python(
                 classification=_classify_path(relative_path),
                 line_count=line_count,
                 keyword_hits=keyword_hits,
+                weighted_keyword_hits=weighted_keyword_hits,
+                input_keyword_hits=input_keyword_hits,
                 distinct_keywords=distinct_keywords,
+                distinct_input_keywords=distinct_input_keywords,
                 definition_hits=definition_hits,
                 matches=matches,
             )
         )
     return records
+
+
+def _keyword_weights(
+    keywords: list[str], input_keywords: set[str]
+) -> dict[str, float]:
+    return {
+        keyword: (4.0 if keyword in input_keywords else 0.1) for keyword in keywords
+    }
 
 
 
@@ -922,14 +1237,22 @@ def _compile_keyword_patterns(
     if match_mode == "word":
         return {
             keyword: re.compile(
-                rf"(?<!\w){re.escape(keyword)}(?!\w)",
+                rf"(?<!\w){_keyword_pattern_text(keyword)}(?!\w)",
                 re.IGNORECASE,
             )
             for keyword in keywords
         }
     return {
-        keyword: re.compile(re.escape(keyword), re.IGNORECASE) for keyword in keywords
+        keyword: re.compile(_keyword_pattern_text(keyword), re.IGNORECASE)
+        for keyword in keywords
     }
+
+
+def _keyword_pattern_text(keyword: str) -> str:
+    tokens = [token for token in _identifier_tokens(keyword) if token]
+    if len(tokens) >= 2:
+        return r"[\W_/-]*".join(re.escape(token) for token in tokens)
+    return re.escape(keyword)
 
 
 def _line_match_details(
@@ -937,32 +1260,51 @@ def _line_match_details(
     compiled_keywords: dict[str, re.Pattern[str]] | None,
     match_mode: Literal["substring", "word", "identifier"] = "substring",
     keywords: set[str] | None = None,
-) -> tuple[set[str], int]:
+    input_keywords: set[str] | None = None,
+    keyword_weights: dict[str, float] | None = None,
+) -> tuple[set[str], int, int, float]:
     if match_mode == "identifier":
-        return _identifier_match_details(line_text, keywords or set())
+        return _identifier_match_details(
+            line_text,
+            keywords or set(),
+            input_keywords or set(),
+            keyword_weights or {},
+        )
     assert compiled_keywords is not None
     matched_keywords: set[str] = set()
     match_count = 0
+    input_keyword_hits = 0
+    weighted_match_hits = 0.0
     for keyword, pattern in compiled_keywords.items():
         occurrences = len(pattern.findall(line_text))
         if occurrences:
             matched_keywords.add(keyword)
             match_count += occurrences
-    return matched_keywords, match_count
+            if input_keywords and keyword in input_keywords:
+                input_keyword_hits += occurrences
+            weighted_match_hits += (keyword_weights or {}).get(keyword, 1.0) * occurrences
+    return matched_keywords, match_count, input_keyword_hits, weighted_match_hits
 
 
 def _identifier_match_details(
     line_text: str,
     keywords: set[str],
-) -> tuple[set[str], int]:
+    input_keywords: set[str],
+    keyword_weights: dict[str, float],
+) -> tuple[set[str], int, int, float]:
     tokens = _identifier_tokens(line_text)
     matched_keywords: set[str] = set()
     match_count = 0
+    input_keyword_hits = 0
+    weighted_match_hits = 0.0
     for token in tokens:
         if token in keywords:
             matched_keywords.add(token)
             match_count += 1
-    return matched_keywords, match_count
+            if token in input_keywords:
+                input_keyword_hits += 1
+            weighted_match_hits += keyword_weights.get(token, 1.0)
+    return matched_keywords, match_count, input_keyword_hits, weighted_match_hits
 
 
 def _identifier_tokens(line_text: str) -> list[str]:
@@ -1031,22 +1373,38 @@ def _count_file_lines(path: Path) -> int:
 
 def _rank_records(
     records: list[FileRecord],
+    input_keyword_count: int,
     keyword_count: int,
     prefer_source_files: bool,
 ) -> None:
     if not records:
         return
+    max_input_hits = max(record.input_keyword_hits for record in records)
+    max_weighted_hits = max(record.weighted_keyword_hits for record in records)
     max_hits = max(record.keyword_hits for record in records)
     max_density = max(
-        record.keyword_hits / max(record.line_count, 1) for record in records
+        record.weighted_keyword_hits / max(record.line_count, 1) for record in records
     )
     max_definition_hits = max(record.definition_hits for record in records)
     for record in records:
+        input_hit_score = (
+            record.input_keyword_hits / max_input_hits if max_input_hits else 0.0
+        )
+        input_distinct_score = (
+            len(record.distinct_input_keywords) / input_keyword_count
+            if input_keyword_count
+            else 0.0
+        )
+        weighted_hit_score = (
+            record.weighted_keyword_hits / max_weighted_hits
+            if max_weighted_hits
+            else 0.0
+        )
         hit_score = record.keyword_hits / max_hits if max_hits else 0.0
         distinct_score = (
             len(record.distinct_keywords) / keyword_count if keyword_count else 0.0
         )
-        density = record.keyword_hits / max(record.line_count, 1)
+        density = record.weighted_keyword_hits / max(record.line_count, 1)
         density_score = density / max_density if max_density else 0.0
         definition_score = 0.0
         if record.definition_hits:
@@ -1060,10 +1418,13 @@ def _rank_records(
         source_bonus = _source_bonus(record.classification, prefer_source_files)
         penalty = _penalty(record.classification)
         score = (
-            0.30 * hit_score
-            + 0.20 * distinct_score
+            0.35 * input_hit_score
+            + 0.25 * input_distinct_score
+            + 0.10 * weighted_hit_score
+            + 0.05 * hit_score
+            + 0.05 * distinct_score
             + 0.20 * source_bonus
-            + 0.10 * density_score
+            + 0.05 * density_score
             + 0.20 * definition_score
             - penalty
         )
@@ -1073,8 +1434,11 @@ def _rank_records(
     records.sort(
         key=lambda record: (
             -record.score,
+            -record.input_keyword_hits,
+            -len(record.distinct_input_keywords),
             -record.definition_hits,
             -len(record.distinct_keywords),
+            -record.weighted_keyword_hits,
             -record.keyword_hits,
             record.relative_path,
         )
@@ -1105,8 +1469,14 @@ def _penalty(classification: FileClassification) -> float:
 
 def _reason_for_record(record: FileRecord) -> str:
     reasons: list[str] = []
+    if record.input_keyword_hits:
+        reasons.append("input keyword matches")
     if record.definition_hits:
         reasons.append("definition hits")
+    if record.distinct_input_keywords and len(record.distinct_keywords) > len(
+        record.distinct_input_keywords
+    ):
+        reasons.append("expansion-assisted recall")
     if len(record.distinct_keywords) > 1:
         reasons.append("multiple keywords")
     if record.classification.is_source_file and not record.classification.is_test_file:
@@ -1174,6 +1544,265 @@ def _extract_snippets(
             remaining_lines -= window_length
 
     return snippets, budget_truncated
+
+
+def _extract_context_blocks(
+    records: list[FileRecord],
+    max_blocks: int,
+    max_blocks_per_file: int,
+    max_total_lines: int,
+    input_keyword_count: int,
+) -> tuple[list[dict[str, Any]], bool]:
+    line_budget_remaining = max_total_lines
+    budget_truncated = False
+    aggregated: list[ContextBlock] = []
+
+    for record in records:
+        file_lines = _read_file_lines(record.path)
+        blocks_by_key: dict[tuple[int, int], ContextBlock] = {}
+        for match in record.matches:
+            block_bounds = _find_enclosing_block(
+                record.relative_path,
+                file_lines,
+                match.line_number,
+            )
+            if block_bounds is None:
+                continue
+            start, end, block_type, signature = block_bounds
+            key = (start, end)
+            block = blocks_by_key.setdefault(
+                key,
+                ContextBlock(
+                    source_path=record.path,
+                    path=record.relative_path,
+                    start=start,
+                    end=end,
+                    block_type=block_type,
+                    signature=signature,
+                ),
+            )
+            block.matched_keywords.update(match.matched_keywords)
+            block.distinct_input_keywords.update(
+                keyword
+                for keyword in match.matched_keywords
+                if keyword in record.distinct_input_keywords
+            )
+            block.input_keyword_hits += match.input_keyword_hits
+            block.keyword_hits += match.match_count
+            if match.definition_hit:
+                block.definition_hits += 1
+            block.match_lines.add(match.line_number)
+
+        ranked_blocks = sorted(
+            blocks_by_key.values(),
+            key=lambda block: (
+                -_score_context_block(block, input_keyword_count),
+                -(block.end - block.start + 1),
+                block.path,
+                block.start,
+            ),
+        )
+        if len(ranked_blocks) > max_blocks_per_file:
+            budget_truncated = True
+        for block in ranked_blocks[:max_blocks_per_file]:
+            block.score = _score_context_block(block, input_keyword_count)
+            aggregated.append(block)
+
+    aggregated.sort(
+        key=lambda block: (
+            -block.score,
+            block.path,
+            block.start,
+        )
+    )
+
+    rendered: list[dict[str, Any]] = []
+    for block in aggregated:
+        if len(rendered) >= max_blocks or line_budget_remaining <= 0:
+            budget_truncated = True
+            break
+        window_length = block.end - block.start + 1
+        if window_length > line_budget_remaining:
+            budget_truncated = True
+            continue
+        rendered_block = _render_context_block(block)
+        if rendered_block is None:
+            continue
+        rendered.append(rendered_block)
+        line_budget_remaining -= window_length
+
+    return rendered, budget_truncated
+
+
+def _score_context_block(block: ContextBlock, input_keyword_count: int) -> float:
+    distinct_input = min(len(block.distinct_input_keywords), input_keyword_count)
+    return (
+        0.5 * block.input_keyword_hits
+        + 0.3 * distinct_input
+        + 0.15 * block.definition_hits
+        + 0.05 * block.keyword_hits
+    )
+
+
+def _render_context_block(block: ContextBlock) -> dict[str, Any] | None:
+    file_lines = _read_file_lines(block.source_path)
+    snippet_lines = file_lines[block.start - 1 : block.end]
+    if not snippet_lines:
+        return None
+    return {
+        "path": block.path,
+        "block_type": block.block_type,
+        "signature": block.signature,
+        "line_start": block.start,
+        "line_end": block.end,
+        "matched_keywords": sorted(block.matched_keywords),
+        "match_lines": sorted(block.match_lines),
+        "score": round(block.score, 3),
+        "content": "".join(snippet_lines),
+    }
+
+
+def _find_enclosing_block(
+    relative_path: str,
+    file_lines: list[str],
+    line_number: int,
+) -> tuple[int, int, str, str] | None:
+    suffix = Path(relative_path).suffix.lower()
+    if suffix == ".py":
+        return _find_python_block(file_lines, line_number)
+    if suffix == ".jl":
+        return _find_julia_block(file_lines, line_number)
+    if suffix in {".js", ".jsx", ".ts", ".tsx", ".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".java", ".go", ".rs", ".swift", ".scala"}:
+        return _find_brace_block(relative_path, file_lines, line_number)
+    return _find_region_block(file_lines, line_number)
+
+
+def _find_python_block(
+    file_lines: list[str],
+    line_number: int,
+) -> tuple[int, int, str, str] | None:
+    definition_index: int | None = None
+    for index in range(min(line_number - 1, len(file_lines) - 1), -1, -1):
+        stripped = file_lines[index].strip()
+        if re.match(r"^(async\s+def|def|class)\s+\w+", stripped):
+            definition_index = index
+            break
+    if definition_index is None:
+        return _find_region_block(file_lines, line_number)
+
+    start = definition_index
+    while start > 0 and file_lines[start - 1].lstrip().startswith("@"):
+        start -= 1
+    signature_line = file_lines[definition_index].strip()
+    indent = len(file_lines[definition_index]) - len(file_lines[definition_index].lstrip(" "))
+    end = len(file_lines)
+    for index in range(definition_index + 1, len(file_lines)):
+        stripped = file_lines[index].strip()
+        if not stripped:
+            continue
+        current_indent = len(file_lines[index]) - len(file_lines[index].lstrip(" "))
+        if current_indent <= indent and not file_lines[index].lstrip().startswith("#"):
+            end = index
+            break
+    return start + 1, end, _python_block_type(signature_line), signature_line
+
+
+def _python_block_type(signature_line: str) -> str:
+    if signature_line.startswith("class "):
+        return "class"
+    return "function"
+
+
+def _find_brace_block(
+    relative_path: str,
+    file_lines: list[str],
+    line_number: int,
+) -> tuple[int, int, str, str] | None:
+    suffix = Path(relative_path).suffix.lower()
+    patterns = DEFINITION_PATTERNS.get(suffix, GENERIC_DEFINITION_PATTERNS)
+    definition_index: int | None = None
+    for index in range(min(line_number - 1, len(file_lines) - 1), -1, -1):
+        stripped = file_lines[index].strip()
+        if any(pattern.search(stripped) for pattern in patterns):
+            definition_index = index
+            break
+    if definition_index is None:
+        return _find_region_block(file_lines, line_number)
+
+    signature_line = file_lines[definition_index].strip()
+    brace_balance = 0
+    seen_open_brace = False
+    end = definition_index + 1
+    for index in range(definition_index, len(file_lines)):
+        line = file_lines[index]
+        brace_balance += line.count("{")
+        if line.count("{"):
+            seen_open_brace = True
+        brace_balance -= line.count("}")
+        end = index + 1
+        if seen_open_brace and brace_balance <= 0:
+            break
+        if not seen_open_brace and index > definition_index and not line.strip():
+            break
+    return definition_index + 1, end, "definition", signature_line
+
+
+def _find_julia_block(
+    file_lines: list[str],
+    line_number: int,
+) -> tuple[int, int, str, str] | None:
+    definition_index: int | None = None
+    for index in range(min(line_number - 1, len(file_lines) - 1), -1, -1):
+        stripped = file_lines[index].strip()
+        if re.match(
+            r"^(function|struct|mutable\s+struct|abstract\s+type|module)\b",
+            stripped,
+            re.IGNORECASE,
+        ) or re.match(r"^[\w!]+\s*\([^)]*\)\s*=", stripped):
+            definition_index = index
+            break
+    if definition_index is None:
+        return _find_region_block(file_lines, line_number)
+
+    signature_line = file_lines[definition_index].strip()
+    if "=" in signature_line and not signature_line.lower().startswith(
+        ("function", "struct", "mutable struct", "abstract type", "module")
+    ):
+        return definition_index + 1, definition_index + 1, "function", signature_line
+
+    depth = 0
+    end = definition_index + 1
+    for index in range(definition_index, len(file_lines)):
+        stripped = file_lines[index].strip()
+        if re.match(
+            r"^(function|struct|mutable\s+struct|abstract\s+type|module)\b",
+            stripped,
+            re.IGNORECASE,
+        ):
+            depth += 1
+        elif stripped == "end":
+            depth -= 1
+            if depth <= 0:
+                end = index + 1
+                break
+    return definition_index + 1, end, "definition", signature_line
+
+
+def _find_region_block(
+    file_lines: list[str],
+    line_number: int,
+) -> tuple[int, int, str, str] | None:
+    if not file_lines:
+        return None
+    index = min(max(line_number - 1, 0), len(file_lines) - 1)
+    start = index
+    while start > 0 and file_lines[start - 1].strip():
+        start -= 1
+    end = index + 1
+    while end < len(file_lines) and file_lines[end].strip():
+        end += 1
+    signature = file_lines[start].strip() if file_lines[start].strip() else f"lines {start + 1}-{end}"
+    return start + 1, end, "region", signature
 
 
 def _log_search_summary(

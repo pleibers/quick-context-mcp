@@ -7,11 +7,11 @@ from urllib.parse import unquote, urlparse
 
 from mcp.server.fastmcp import Context, FastMCP
 
-from repo_context_search import search_repo_context_result
+from repo_context_search import focused_context_result, search_repo_context_result
 
 SERVER_INSTRUCTIONS = (
-    "quick-search provides bounded repository retrieval for keyword-driven or "
-    "prompt-driven codebase "
+    "quick-search provides bounded repository retrieval for keyword-driven "
+    "codebase "
     "exploration. Use search_repo_context when you want likely relevant files and "
     "small, targeted snippets instead of reading whole files. The tool searches the "
     "current working directory by default, or an explicitly provided directory, then "
@@ -27,21 +27,25 @@ SERVER_INSTRUCTIONS = (
     "and snippet budgets are tight. For agent use, pass an absolute directory path. "
     "Relative directory values such as '.' are only a best-effort fallback when the "
     "MCP client exposes roots, and must not be relied on across clients. This tool "
-    "can derive a bounded keyword set from prompt text and returns the resolved "
-    "query terms for transparency. Agent workflow: start with output_mode='compact' "
+    "expands provided keywords into a bounded, more general query set and returns "
+    "the resolved query terms for transparency. Prefer specific keywords over very "
+    "general ones, because expansion terms are only weak recall helpers and the "
+    "ranking favors matches on the original input keywords. Agent workflow: start with output_mode='compact' "
     "and include_diagnostics=false to keep context small; if the result looks "
     "promising but you need more ranking or query detail, reuse the returned "
     "query_id with output_mode='full' to expand the cached result without "
     "recomputing; if you need to debug empty or surprising results, reuse the same "
     "query_id with include_diagnostics=true. It is best for broad repo search, "
     "feature discovery, symbol hunting, and narrowing a large codebase before "
-    "normal reads. Only do further searches across the repository if this context "
-    "is insufficient."
+    "normal reads. When broad search indicates the relevant code is spread across "
+    "multiple files, use the focused context tool to retrieve full enclosing "
+    "definitions from just those files. Only do further searches across the "
+    "repository if this context is insufficient."
 )
 
 DEFAULT_MAX_FILES = 12
-DEFAULT_MAX_SNIPPETS = 24
-DEFAULT_MAX_TOTAL_LINES = 400
+DEFAULT_MAX_SNIPPETS = 8
+DEFAULT_MAX_TOTAL_LINES = 1200
 
 mcp = FastMCP(
     name="quick-search",
@@ -52,7 +56,7 @@ mcp = FastMCP(
 @mcp.tool(
     name="search_repo_context",
     description=(
-        "Search a repository with explicit keywords or a prompt, rank likely relevant "
+        "Search a repository with explicit keywords, rank likely relevant "
         "files without reading full files, and return bounded snippets around the "
         "strongest clustered matches. The tool prefers source files over docs when "
         "scores are similar, boosts likely function, class, struct, module, or method "
@@ -60,8 +64,10 @@ mcp = FastMCP(
         "on returned files, snippets, and total lines. Optional subtree and glob "
         "filters can narrow the search space before ranking. Matching defaults to "
         "substring mode, with optional word and identifier-aware modes for stricter "
-        "code search. Prompt-derived keyword expansion is heuristic, bounded, and "
-        "returned transparently in the output. Preferred agent workflow: call the "
+        "code search. Keyword expansion is bounded and returned transparently in the "
+        "output. Prefer specific keywords over very general ones; ranking gives "
+        "substantially more weight to matches on the original input keywords than "
+        "to expansion-only matches. Preferred agent workflow: call the "
         "tool in compact mode first, then expand the cached result by query_id in "
         "full mode only if you need richer metadata; enable diagnostics only for "
         "debugging or tuning. Use it to narrow a large repo before deeper "
@@ -77,7 +83,6 @@ mcp = FastMCP(
 )
 async def search_repo_context(
     keywords: list[str] | None = None,
-    prompt: str | None = None,
     query_id: str | None = None,
     directory: str | None = None,
     subpath: str | None = None,
@@ -88,8 +93,8 @@ async def search_repo_context(
     output_mode: str = "compact",
     max_files: int | None = None,
     max_snippets: int | None = None,
-    lines_before: int = 8,
-    lines_after: int = 12,
+    lines_before: int = 24,
+    lines_after: int = 40,
     prefer_source_files: bool = True,
     max_total_lines: int | None = None,
     ctx: Context | None = None,
@@ -97,10 +102,9 @@ async def search_repo_context(
     """Return ranked file candidates and bounded snippets for keyword-driven repo search.
 
     Args:
-        keywords: Optional explicit keywords to search for.
-        prompt: Optional prompt text from which a bounded keyword set will be
-            derived. Explicit keywords are preserved and prompt-derived terms
-            are added transparently.
+        keywords: Optional explicit keywords to search for. Prefer specific
+            phrases or identifiers over very general terms because ranking
+            prioritizes original input-keyword matches.
         query_id: Optional cached result id returned by a prior call. When
             provided, the cached search result is rendered again with the
             requested output_mode and diagnostics settings without recomputing
@@ -136,7 +140,6 @@ async def search_repo_context(
     resolved_directory = await _resolve_directory(directory, ctx)
     return search_repo_context_result(
         keywords=keywords,
-        prompt=prompt,
         query_id=query_id,
         directory=resolved_directory,
         subpath=subpath,
@@ -159,6 +162,70 @@ async def search_repo_context(
             max_total_lines,
             DEFAULT_MAX_TOTAL_LINES,
         ),
+    )
+
+
+@mcp.tool(
+    name="search_focused_context",
+    description=(
+        "Use this only after `search_repo_context` when the relevant code is spread "
+        "across multiple files and you need full enclosing functions, classes, or "
+        "similar definitions instead of truncated snippets. It reuses a prior "
+        "`query_id`, narrows to a few files, prefers source files, and returns "
+        "complete matching blocks without dumping whole files."
+    ),
+    structured_output=True,
+)
+async def search_focused_context(
+    query_id: str | None = None,
+    keywords: list[str] | None = None,
+    directory: str | None = None,
+    subpath: str | None = None,
+    paths_include_glob: str | None = None,
+    paths_exclude_glob: str | None = None,
+    match_mode: str = "substring",
+    file_paths: list[str] | None = None,
+    max_files: int = 3,
+    max_blocks: int = 6,
+    max_blocks_per_file: int = 2,
+    max_total_lines: int = 400,
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    """Return multi-file focused code context from a prior broad repo search.
+
+    Args:
+        query_id: Optional cached search id returned by `search_repo_context`.
+        keywords: Optional explicit keywords for standalone focused search.
+        directory: Root directory for standalone focused search.
+        subpath: Optional subtree or file restriction for standalone focused search.
+        paths_include_glob: Optional include glob for standalone focused search.
+        paths_exclude_glob: Optional exclude glob for standalone focused search.
+        match_mode: Matching mode for standalone focused search.
+        file_paths: Optional relative paths to focus on. When omitted, the tool
+            selects the strongest source files from the broad-search result.
+        max_files: Maximum number of files to consider.
+        max_blocks: Maximum number of full blocks to return across files.
+        max_blocks_per_file: Maximum number of blocks to return from any single file.
+        max_total_lines: Global line budget across returned blocks.
+
+    Returns:
+        Structured JSON-compatible data with the selected files and full
+        enclosing code blocks around the strongest matches.
+    """
+    resolved_directory = await _resolve_directory(directory, ctx)
+    return focused_context_result(
+        query_id=query_id,
+        keywords=keywords,
+        directory=resolved_directory,
+        subpath=subpath,
+        paths_include_glob=paths_include_glob,
+        paths_exclude_glob=paths_exclude_glob,
+        match_mode=match_mode,
+        file_paths=file_paths,
+        max_files=max_files,
+        max_blocks=max_blocks,
+        max_blocks_per_file=max_blocks_per_file,
+        max_total_lines=max_total_lines,
     )
 
 
